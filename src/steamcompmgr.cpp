@@ -7031,7 +7031,7 @@ steamcompmgr_main(int argc, char **argv)
 			currentHDRForce = g_bForceHDRSupportDebug;
 
 #if HAVE_PIPEWIRE
-			nudge_pipewire();
+			pipewire_resize_output(currentOutputWidth, currentOutputHeight);
 #endif
 		}
 

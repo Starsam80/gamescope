@@ -18,6 +18,7 @@ struct pipewire_state {
 	uint32_t stream_node_id = SPA_ID_INVALID;
 	bool streaming;
 	struct spa_video_info_raw video_info;
+	struct spa_rectangle output_size;
 	bool dmabuf;
 	int shm_stride;
 	uint64_t seq;
@@ -45,3 +46,4 @@ uint32_t get_pipewire_stream_node_id(void);
 struct pipewire_buffer *dequeue_pipewire_buffer(void);
 void push_pipewire_buffer(struct pipewire_buffer *buffer);
 void nudge_pipewire(void);
+void pipewire_resize_output(uint32_t width, uint32_t height);
