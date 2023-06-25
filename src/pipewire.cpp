@@ -11,11 +11,53 @@
 #include "pipewire.hpp"
 #include "rendervulkan.hpp"
 
+#include <pipewire/pipewire.h>
 #include <spa/debug/types.h>
+#include <spa/param/video/format-utils.h>
 
 static LogScope pwr_log("pipewire");
 
-static struct pipewire_state pipewire_state{};
+static class pipewire_stream
+{
+public:
+	pipewire_stream();
+	~pipewire_stream();
+
+	void state_changed(enum pw_stream_state old_state, enum pw_stream_state state, const char *error);
+	void param_changed(uint32_t param_id, const struct spa_pod *param);
+	void add_buffer(struct pw_buffer *buffer);
+	void remove_buffer(struct pw_buffer *buffer);
+	void process();
+
+	bool init();
+	void copy_texture(const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue);
+	void resize_output(uint32_t width, uint32_t height);
+
+	uint32_t get_node_id() { return m_stream ? pw_stream_get_node_id(m_stream) : SPA_ID_INVALID; }
+	bool is_streaming() { return m_stream && pw_stream_get_state(m_stream, nullptr) == PW_STREAM_STATE_STREAMING; }
+
+	struct pw_thread_loop *m_thread = nullptr;
+	struct pw_context *m_context = nullptr;
+	struct pw_core *m_core = nullptr;
+	struct pw_stream *m_stream = nullptr;
+
+	struct spa_video_info_raw m_video_info = {};
+	struct spa_rectangle m_output_size = {};
+	uint64_t m_seq = 0;
+
+	std::atomic<std::shared_ptr<CVulkanTexture>> m_queue;
+} g_pipewire{};
+
+#define CALLBACK(cb_name) [](void *this_, auto... args) { return reinterpret_cast<pipewire_stream *>(this_)->cb_name(args...); }
+static constexpr struct pw_stream_events stream_events = {
+	.version = PW_VERSION_STREAM_EVENTS,
+	.state_changed = CALLBACK(state_changed),
+	.param_changed = CALLBACK(param_changed),
+	.add_buffer = CALLBACK(add_buffer),
+	.remove_buffer = CALLBACK(remove_buffer),
+	.process = CALLBACK(process),
+};
+#undef CALLBACK
 
 struct buffer_data
 {
@@ -34,12 +76,9 @@ private:
 	struct pw_thread_loop *m_thread;
 };
 
-// Pending buffer for steamcompmgr → PipeWire
-static std::atomic<std::shared_ptr<CVulkanTexture>> in_buffer;
-
 static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder)
 {
-	const struct spa_rectangle size = pipewire_state.output_size;
+	const struct spa_rectangle size = g_pipewire.m_output_size;
 	const struct spa_rectangle min_size = SPA_RECTANGLE(0, 0);
 	const struct spa_rectangle max_size = SPA_RECTANGLE(INT32_MAX, INT32_MAX);
 	const struct spa_fraction framerate = SPA_FRACTION((uint32_t)g_nOutputRefresh, 1);
@@ -85,21 +124,21 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 	};
 }
 
-static void copy_texture(struct pipewire_state *state, const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue)
+void pipewire_stream::copy_texture(const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue)
 {
-	if (!state->streaming) {
+	if (!is_streaming()) {
 		return;
 	}
 
 	if (queue) {
-		in_buffer = compositeImage;
-		pw_stream_trigger_process(state->stream);
+		m_queue = compositeImage;
+		pw_stream_trigger_process(m_stream);
 		return;
 	}
 
-	pipewire_lock lock(state->thread);
+	pipewire_lock lock(m_thread);
 
-	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
+	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(m_stream);
 	if (!pw_buffer) {
 		pwr_log.errorf("warning: out of buffers");
 		return;
@@ -115,7 +154,7 @@ static void copy_texture(struct pipewire_state *state, const std::shared_ptr<CVu
 	if (header != nullptr) {
 		header->pts = -1;
 		header->flags = 0;
-		header->seq = state->seq++;
+		header->seq = m_seq++;
 		header->dts_offset = 0;
 	}
 
@@ -132,81 +171,65 @@ static void copy_texture(struct pipewire_state *state, const std::shared_ptr<CVu
 		}
 	}
 
-	int ret = pw_stream_queue_buffer(state->stream, pw_buffer);
+	int ret = pw_stream_queue_buffer(m_stream, pw_buffer);
 	if (ret < 0) {
 		pwr_log.errorf("pw_stream_queue_buffer failed");
 	}
 }
 
-void pipewire_resize_output(uint32_t width, uint32_t height)
+void pipewire_stream::resize_output(uint32_t width, uint32_t height)
 {
-	struct pipewire_state *state = &pipewire_state;
-
-	const auto& current = state->video_info.size;
+	const auto& current = m_video_info.size;
 	if (current.width == width && current.height == height) {
 		return;
 	}
 
 	pwr_log.debugf("renegotiating stream params (size: %dx%d)", width, height);
-	pipewire_lock lock(state->thread);
-	state->output_size = SPA_RECTANGLE(width, height);
+	pipewire_lock lock(m_thread);
+	m_output_size = SPA_RECTANGLE(width, height);
 
 	uint8_t buf[4096];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
-	int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
+	int ret = pw_stream_update_params(m_stream, format_params.data(), format_params.size());
 	if (ret < 0) {
 		pwr_log.errorf("pw_stream_update_params failed");
 	}
 }
 
-static void stream_handle_process(void *data)
+void pipewire_stream::process()
 {
-	struct pipewire_state *state = (struct pipewire_state *) data;
-
-	if (auto compositeImage = in_buffer.exchange(nullptr)) {
-		copy_texture(state, compositeImage, false);
+	if (auto compositeImage = m_queue.exchange(nullptr)) {
+		copy_texture(compositeImage, false);
 	}
 }
 
-static void stream_handle_state_changed(void *data, enum pw_stream_state old_stream_state, enum pw_stream_state stream_state, const char *error)
+void pipewire_stream::state_changed(enum pw_stream_state old_state, enum pw_stream_state state, const char *error)
 {
-	struct pipewire_state *state = (struct pipewire_state *) data;
+	pwr_log.debugf("stream state changed: %s", pw_stream_state_as_string(state));
 
-	pwr_log.debugf("stream state changed: %s", pw_stream_state_as_string(stream_state));
-
-	switch (stream_state) {
+	switch (state) {
 	case PW_STREAM_STATE_PAUSED:
-		if (state->stream_node_id == SPA_ID_INVALID) {
-			state->stream_node_id = pw_stream_get_node_id(state->stream);
-		}
-		state->streaming = false;
-		state->seq = 0;
-		break;
-	case PW_STREAM_STATE_STREAMING:
-		state->streaming = true;
+		m_seq = 0;
 		break;
 	default:
 		break;
 	}
 }
 
-static void stream_handle_param_changed(void *data, uint32_t id, const struct spa_pod *param)
+void pipewire_stream::param_changed(uint32_t param_id, const struct spa_pod *param)
 {
-	struct pipewire_state *state = (struct pipewire_state *) data;
-
-	if (param == nullptr || id != SPA_PARAM_Format)
+	if (param == nullptr || param_id != SPA_PARAM_Format)
 		return;
 
-
-	int ret = spa_format_video_raw_parse(param, &state->video_info);
+	int ret = spa_format_video_raw_parse(param, &m_video_info);
 	if (ret < 0) {
 		pwr_log.errorf("spa_format_video_raw_parse failed");
 		return;
 	}
 
-	const int blocks = state->video_info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
-	const bool dmabuf = (state->video_info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+	const int blocks = m_video_info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
+	const bool dmabuf = (m_video_info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
 	const int data_type = 1 << (dmabuf ? SPA_DATA_DmaBuf : SPA_DATA_MemFd);
 
 	uint8_t buf[1024];
@@ -224,15 +247,15 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 			SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header))),
 	};
 
-	ret = pw_stream_update_params(state->stream, params.data(), params.size());
+	ret = pw_stream_update_params(m_stream, params.data(), params.size());
 	if (ret != 0) {
 		pwr_log.errorf("pw_stream_update_params failed");
 	}
 
 	pwr_log.debugf("format changed (size: %dx%d, format: %s, flags: %d)",
-		state->video_info.size.width, state->video_info.size.height,
-		spa_debug_type_find_short_name(spa_type_video_format, state->video_info.format),
-		state->video_info.flags);
+		m_video_info.size.width, m_video_info.size.height,
+		spa_debug_type_find_short_name(spa_type_video_format, m_video_info.format),
+		m_video_info.flags);
 }
 
 static void randname(char *buf)
@@ -296,22 +319,20 @@ EStreamColorspace spa_color_to_gamescope(enum spa_video_color_matrix matrix, enu
 	}
 }
 
-static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffer)
+void pipewire_stream::add_buffer(struct pw_buffer *pw_buffer)
 {
-	struct pipewire_state *state = (struct pipewire_state *) user_data;
-
 	struct buffer_data *extra_data = new buffer_data();
 	pw_buffer->user_data = extra_data;
 
-	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
+	uint32_t drmFormat = spa_format_to_drm(m_video_info.format);
 
-	const bool is_dmabuf = (state->video_info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
-	if (is_dmabuf) assert(state->video_info.modifier == DRM_FORMAT_MOD_LINEAR);
+	const bool is_dmabuf = (m_video_info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+	if (is_dmabuf) assert(m_video_info.modifier == DRM_FORMAT_MOD_LINEAR);
 
-	extra_data->texture = vulkan_create_screenshot_texture(state->video_info.size.width, state->video_info.size.height, drmFormat, is_dmabuf);
+	extra_data->texture = vulkan_create_screenshot_texture(m_video_info.size.width, m_video_info.size.height, drmFormat, is_dmabuf);
 	const auto& tex = extra_data->texture;
 
-	EStreamColorspace colorspace = spa_color_to_gamescope(state->video_info.color_matrix, state->video_info.color_range);
+	EStreamColorspace colorspace = spa_color_to_gamescope(m_video_info.color_matrix, m_video_info.color_range);
 	tex->setStreamColorspace(colorspace);
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
@@ -358,7 +379,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	}
 }
 
-static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
+void pipewire_stream::remove_buffer(struct pw_buffer *pw_buffer)
 {
 	struct buffer_data *extra_data = (struct buffer_data *) pw_buffer->user_data;
 	delete extra_data;
@@ -374,120 +395,112 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 	}
 }
 
-static const struct pw_stream_events stream_events = {
-	.version = PW_VERSION_STREAM_EVENTS,
-	.state_changed = stream_handle_state_changed,
-	.param_changed = stream_handle_param_changed,
-	.add_buffer = stream_handle_add_buffer,
-	.remove_buffer = stream_handle_remove_buffer,
-	.process = stream_handle_process,
-};
-
-pipewire_state::pipewire_state()
+pipewire_stream::pipewire_stream()
 {
 	pw_init(nullptr, nullptr);
 }
 
-pipewire_state::~pipewire_state()
+pipewire_stream::~pipewire_stream()
 {
-	struct pipewire_state *state = this;
-	if (state->thread) {
-		pw_thread_loop_stop(state->thread);
-		if (state->stream) {
-			pw_stream_destroy(state->stream);
+	if (m_thread) {
+		pw_thread_loop_stop(m_thread);
+		if (m_stream) {
+			pw_stream_destroy(m_stream);
 		}
-		if (state->core) {
-			pw_core_disconnect(state->core);
+		if (m_core) {
+			pw_core_disconnect(m_core);
 		}
-		if (state->context) {
-			pw_context_destroy(state->context);
+		if (m_context) {
+			pw_context_destroy(m_context);
 		}
-		pw_thread_loop_destroy(state->thread);
+		pw_thread_loop_destroy(m_thread);
 	}
 	pw_deinit();
 }
 
-bool init_pipewire(void)
+bool pipewire_stream::init()
 {
-	struct pipewire_state *state = &pipewire_state;
-
-	state->thread = pw_thread_loop_new("gamescope-pw", nullptr);
-	if (!state->thread) {
+	m_thread = pw_thread_loop_new("gamescope-pw", nullptr);
+	if (!m_thread) {
 		pwr_log.errorf("pw_thread_loop_new failed");
 		return false;
 	}
 
-	pipewire_lock lock(state->thread);
-	pw_thread_loop_start(state->thread);
+	pipewire_lock lock(m_thread);
+	pw_thread_loop_start(m_thread);
 
-	state->context = pw_context_new(pw_thread_loop_get_loop(state->thread), nullptr, 0);
-	if (!state->context) {
+	m_context = pw_context_new(pw_thread_loop_get_loop(m_thread), nullptr, 0);
+	if (!m_context) {
 		pwr_log.errorf("pw_context_new failed");
 		return false;
 	}
 
-	state->core = pw_context_connect(state->context, nullptr, 0);
-	if (!state->core) {
+	m_core = pw_context_connect(m_context, nullptr, 0);
+	if (!m_core) {
 		pwr_log.errorf("pw_context_connect failed");
 		return false;
 	}
 
-	state->stream = pw_stream_new(state->core, "gamescope",
+	m_stream = pw_stream_new(m_core, "gamescope",
 		pw_properties_new(
 			PW_KEY_MEDIA_CLASS, "Video/Source",
 			nullptr));
-	if (!state->stream) {
+	if (!m_stream) {
 		pwr_log.errorf("pw_stream_new failed");
 		return false;
 	}
 
 	static struct spa_hook stream_hook;
-	pw_stream_add_listener(state->stream, &stream_hook, &stream_events, state);
+	pw_stream_add_listener(m_stream, &stream_hook, &stream_events, this);
 
-	state->output_size = SPA_RECTANGLE(g_nOutputWidth, g_nOutputHeight);
+	m_output_size = SPA_RECTANGLE(g_nOutputWidth, g_nOutputHeight);
 
 	uint8_t buf[4096];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
 
 	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
-	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
+	int ret = pw_stream_connect(m_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
 	if (ret != 0) {
 		pwr_log.errorf("pw_stream_connect failed");
 		return false;
 	}
 
-	while (state->stream_node_id == SPA_ID_INVALID) {
+	while (get_node_id() == SPA_ID_INVALID) {
 		if (lock.iterate() < 0) {
 			pwr_log.errorf("pw_loop_iterate failed");
 			return false;
 		}
 	}
 
-	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
+	pwr_log.infof("stream available on node ID: %u", get_node_id());
 
 	return true;
 }
 
-uint32_t get_pipewire_stream_node_id(void)
+void pipewire_init(void)
 {
-	return pipewire_state.stream_node_id;
+	if (!g_pipewire.init()) {
+		pwr_log.errorf("failed to setup PipeWire, screen capture won't be available.");
+	}
+}
+
+uint32_t pipewire_get_node_id(void)
+{
+	return g_pipewire.get_node_id();
 }
 
 bool pipewire_is_streaming(void)
 {
-	struct pipewire_state *state = &pipewire_state;
-	return state->streaming;
+	return g_pipewire.is_streaming();
 }
 
 void pipewire_copy_texture(const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue)
 {
-	struct pipewire_state *state = &pipewire_state;
-	copy_texture(state, compositeImage, queue);
+	g_pipewire.copy_texture(compositeImage, queue);
 }
 
-void nudge_pipewire(void)
+void pipewire_resize_output(uint32_t width, uint32_t height)
 {
-	struct pipewire_state *state = &pipewire_state;
-	pw_stream_trigger_process(state->stream);
+	g_pipewire.resize_output(width, height);
 }

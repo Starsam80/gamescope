@@ -788,10 +788,7 @@ int main(int argc, char **argv)
 		setenv("WAYLAND_DISPLAY", wlserver_get_wl_display_name(), 1);
 
 #if HAVE_PIPEWIRE
-	if ( !init_pipewire() )
-	{
-		fprintf( stderr, "Warning: failed to setup PipeWire, screen capture won't be available\n" );
-	}
+	pipewire_init();
 #endif
 
 	std::thread steamCompMgrThread( steamCompMgrThreadRun, argc, argv );
