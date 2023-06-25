@@ -367,7 +367,7 @@ struct TextureState
 class CVulkanCmdBuffer
 {
 public:
-	CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer);
+	CVulkanCmdBuffer(CVulkanDevice *device);
 	~CVulkanCmdBuffer();
 	CVulkanCmdBuffer(const CVulkanCmdBuffer& other) = delete;
 	CVulkanCmdBuffer(CVulkanCmdBuffer&& other) = delete;
@@ -378,6 +378,9 @@ public:
 	void reset();
 	void begin();
 	void end();
+	uint64_t submit();
+	void wait(uint64_t sequenceValue = 0);
+	bool isFinished();
 	void bindTexture(uint32_t slot, std::shared_ptr<CVulkanTexture> texture);
 	void bindColorMgmtLuts(uint32_t slot, const std::shared_ptr<CVulkanTexture>& lut1d, const std::shared_ptr<CVulkanTexture>& lut3d);
 	void setTextureStorage(bool storage);
@@ -393,7 +396,6 @@ public:
 	void copyImage(std::shared_ptr<CVulkanTexture> src, std::shared_ptr<CVulkanTexture> dst);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, std::shared_ptr<CVulkanTexture> dst);
 
-
 private:
 	void prepareSrcImage(CVulkanTexture *image);
 	void prepareDestImage(CVulkanTexture *image);
@@ -402,6 +404,9 @@ private:
 
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
+
+	VkSemaphore m_semaphore = VK_NULL_HANDLE;
+	uint64_t m_timelineSequence = 0;
 
 	// Per Use State
 	std::unordered_map<CVulkanTexture *, std::shared_ptr<CVulkanTexture>> m_textureRefs;
@@ -468,6 +473,7 @@ private:
 	VK_FUNC(DestroyImage) \
 	VK_FUNC(DestroyImageView) \
 	VK_FUNC(DestroyPipeline) \
+	VK_FUNC(DestroySemaphore) \
 	VK_FUNC(DestroySwapchainKHR) \
 	VK_FUNC(EndCommandBuffer) \
 	VK_FUNC(FreeCommandBuffers) \
@@ -498,11 +504,8 @@ public:
 	VkSampler sampler(SamplerState key);
 	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false);
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
-	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
-	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
-	void wait(uint64_t sequence);
+	std::shared_ptr<CVulkanCmdBuffer> commandBuffer();
 	void waitIdle();
-	void garbageCollect();
 	inline VkDescriptorSet descriptorSet()
 	{
 		VkDescriptorSet ret = m_descriptorSets[m_currentDescriptorSet];
@@ -584,11 +587,7 @@ private:
 	VkDeviceMemory m_uploadBufferMemory;
 	void *m_uploadBufferData;
 
-
-	VkSemaphore m_scratchTimelineSemaphore;
-	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
-	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
-	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+	std::vector<std::shared_ptr<CVulkanCmdBuffer>> m_cmdBuffers;
 };
 
 bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
@@ -1204,23 +1203,6 @@ bool CVulkanDevice::createScratchResources()
 		return false;
 	}
 
-	VkSemaphoreTypeCreateInfo timelineCreateInfo = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-	};
-
-	VkSemaphoreCreateInfo semCreateInfo = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-		.pNext = &timelineCreateInfo,
-	};
-
-	res = vk.CreateSemaphore( device(), &semCreateInfo, NULL, &m_scratchTimelineSemaphore );
-	if ( res != VK_SUCCESS )
-	{
-		vk_errorf( res, "vkCreateSemaphore failed" );
-		return false;
-	}
-
 	return true;
 }
 
@@ -1412,134 +1394,59 @@ int32_t CVulkanDevice::findMemoryType( VkMemoryPropertyFlags properties, uint32_
 	return -1;
 }
 
-std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
+std::shared_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
 {
-	std::unique_ptr<CVulkanCmdBuffer> cmdBuffer;
-	if (m_unusedCmdBufs.empty())
-	{
-		VkCommandBuffer rawCmdBuffer;
-		VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
-			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-			.commandPool = m_commandPool,
-			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-			.commandBufferCount = 1
-		};
-
-		VkResult res = vk.AllocateCommandBuffers( device(), &commandBufferAllocateInfo, &rawCmdBuffer );
-		if ( res != VK_SUCCESS )
-		{
-			vk_errorf( res, "vkAllocateCommandBuffers failed" );
-			return nullptr;
+	static std::mutex s_mutex;
+	std::lock_guard<std::mutex> lock(s_mutex);
+	for (auto& cmdBuffer : m_cmdBuffers) {
+		if (cmdBuffer->isFinished()) {
+			cmdBuffer->reset();
+			cmdBuffer->begin();
+			return cmdBuffer;
 		}
-
-		cmdBuffer = std::make_unique<CVulkanCmdBuffer>(this, rawCmdBuffer);
 	}
-	else
-	{
-		cmdBuffer = std::move(m_unusedCmdBufs.back());
-		m_unusedCmdBufs.pop_back();
-	}
-
+	auto& cmdBuffer = m_cmdBuffers.emplace_back(std::make_shared<CVulkanCmdBuffer>(this));
 	cmdBuffer->begin();
 	return cmdBuffer;
 }
 
-uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
+void CVulkanDevice::waitIdle() {
+	for (auto& cmdBuffer : m_cmdBuffers) {
+		cmdBuffer->wait();
+	}
+}
+
+CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *device)
+	: m_device(device)
 {
-	cmdBuffer->end();
-
-	// The seq no of the last submission.
-	const uint64_t lastSubmissionSeqNo = m_submissionSeqNo++;
-
-	// This is the seq no of the command buffer we are going to submit.
-	const uint64_t nextSeqNo = lastSubmissionSeqNo + 1;
-
-	VkTimelineSemaphoreSubmitInfo timelineInfo = {
-		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-		// no need to ensure order of cmd buffer submission, we only have one queue
-		.waitSemaphoreValueCount = 0,
-		.pWaitSemaphoreValues = nullptr,
-		.signalSemaphoreValueCount = 1,
-		.pSignalSemaphoreValues = &nextSeqNo,
+	const VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = m_device->commandPool(),
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1
 	};
 
-	VkCommandBuffer rawCmdBuffer = cmdBuffer->rawBuffer();
+	VkResult res = m_device->vk.AllocateCommandBuffers(m_device->device(), &commandBufferAllocateInfo, &m_cmdBuffer);
+	assert(res == VK_SUCCESS);
 
-	VkSubmitInfo submitInfo = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		.pNext = &timelineInfo,
-		.commandBufferCount = 1,
-		.pCommandBuffers = &rawCmdBuffer,
-		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = &m_scratchTimelineSemaphore,
+	const VkSemaphoreTypeCreateInfo timelineCreateInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
 	};
 
-	VkResult res = vk.QueueSubmit( queue(), 1, &submitInfo, VK_NULL_HANDLE );
+	const VkSemaphoreCreateInfo semCreateInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = &timelineCreateInfo,
+	};
 
-	if ( res != VK_SUCCESS )
-	{
-		assert( 0 );
-	}
-
-	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
-
-	return nextSeqNo;
-}
-
-void CVulkanDevice::garbageCollect( void )
-{
-	uint64_t currentSeqNo;
-	VkResult res = vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo);
-	assert( res == VK_SUCCESS );
-
-	resetCmdBuffers(currentSeqNo);
-}
-
-void CVulkanDevice::wait(uint64_t sequence)
-{
-	VkSemaphoreWaitInfo waitInfo = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-		.semaphoreCount = 1,
-		.pSemaphores = &m_scratchTimelineSemaphore,
-		.pValues = &sequence,
-	} ;
-
-	VkResult res = vk.WaitSemaphores(device(), &waitInfo, ~0ull);
-	if (res != VK_SUCCESS)
-		assert( 0 );
-	resetCmdBuffers(sequence);
-}
-
-void CVulkanDevice::waitIdle()
-{
-	wait(m_submissionSeqNo);
-}
-
-void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
-{
-	auto last = m_pendingCmdBufs.find(sequence);
-	if (last == m_pendingCmdBufs.end())
-		return;
-
-	for (auto it = m_pendingCmdBufs.begin(); ; it++)
-	{
-		it->second->reset();
-		m_unusedCmdBufs.push_back(std::move(it->second));
-		if (it == last)
-			break;
-	}
-
-	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), ++last);
-}
-
-CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer)
-	: m_cmdBuffer(cmdBuffer), m_device(parent)
-{
+	res = m_device->vk.CreateSemaphore(m_device->device(), &semCreateInfo, nullptr, &m_semaphore);
+	assert(res == VK_SUCCESS);
 }
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
 {
 	m_device->vk.FreeCommandBuffers(m_device->device(), m_device->commandPool(), 1, &m_cmdBuffer);
+	m_device->vk.DestroySemaphore(m_device->device(), m_semaphore, nullptr);
 }
 
 void CVulkanCmdBuffer::reset()
@@ -1561,6 +1468,7 @@ void CVulkanCmdBuffer::begin()
 	assert(res == VK_SUCCESS);
 
 	clearState();
+	m_timelineSequence++;
 }
 
 void CVulkanCmdBuffer::end()
@@ -1568,6 +1476,57 @@ void CVulkanCmdBuffer::end()
 	insertBarrier(true);
 	VkResult res = m_device->vk.EndCommandBuffer(m_cmdBuffer);
 	assert(res == VK_SUCCESS);
+}
+
+uint64_t CVulkanCmdBuffer::submit()
+{
+	end();
+
+	const VkTimelineSemaphoreSubmitInfo timelineInfo = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+		// no need to ensure order of cmd buffer submission, we only have one queue
+		.waitSemaphoreValueCount = 0,
+		.pWaitSemaphoreValues = nullptr,
+		.signalSemaphoreValueCount = 1,
+		.pSignalSemaphoreValues = &m_timelineSequence,
+	};
+
+	const VkSubmitInfo submitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = &timelineInfo,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &m_cmdBuffer,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &m_semaphore,
+	};
+
+	VkResult res = m_device->vk.QueueSubmit(m_device->queue(), 1, &submitInfo, VK_NULL_HANDLE);
+	assert(res == VK_SUCCESS);
+
+	return m_timelineSequence;
+}
+
+void CVulkanCmdBuffer::wait(uint64_t sequenceValue) {
+	if (sequenceValue == 0) {
+		sequenceValue = m_timelineSequence;
+	}
+
+	const VkSemaphoreWaitInfo waitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+		.semaphoreCount = 1,
+		.pSemaphores = &m_semaphore,
+		.pValues = &sequenceValue,
+	};
+
+	VkResult res = m_device->vk.WaitSemaphores(m_device->device(), &waitInfo, UINT64_MAX);
+	assert(res == VK_SUCCESS);
+}
+
+bool CVulkanCmdBuffer::isFinished() {
+	uint64_t current;
+	VkResult res = m_device->vk.GetSemaphoreCounterValue(m_device->device(), m_semaphore, &current);
+	assert(res == VK_SUCCESS);
+	return current >= m_timelineSequence;
 }
 
 void CVulkanCmdBuffer::bindTexture(uint32_t slot, std::shared_ptr<CVulkanTexture> texture)
@@ -2803,8 +2762,8 @@ void vulkan_update_luts(const std::shared_ptr<CVulkanTexture>& lut1d, const std:
 	auto cmdBuffer = g_device.commandBuffer();
 	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), 0, 0, lut1d);
 	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), lut1d_size, 0, lut3d);
-	g_device.submit(std::move(cmdBuffer));
-	g_device.waitIdle(); // TODO: Sync this better
+	cmdBuffer->submit();
+	cmdBuffer->wait(); // TODO: Sync this better
 }
 
 #if HAVE_OPENVR
@@ -3110,9 +3069,7 @@ static bool init_nis_data()
 	uint32_t height = kPhaseCount;
 
 	g_output.nisScalerImage = vulkan_create_texture_from_bits( width, height, width, height, nisFormat, {}, coefScaleData );
-	g_device.waitIdle();
 	g_output.nisUsmImage = vulkan_create_texture_from_bits( width, height, width, height, nisFormat, {}, coefUsmData );
-	g_device.waitIdle();
 
 	return true;
 }
@@ -3211,8 +3168,8 @@ std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width,
 
 	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), 0, 0, pTex);
 	// TODO: Sync this copyBufferToImage.
-
-	g_device.submit(std::move(cmdBuffer));
+	cmdBuffer->submit();
+	cmdBuffer->wait();
 
 	return pTex;
 }
@@ -3223,11 +3180,6 @@ bool float_is_integer(float x)
 }
 
 static uint32_t s_frameId = 0;
-
-void vulkan_garbage_collect( void )
-{
-	g_device.garbageCollect();
-}
 
 std::shared_ptr<CVulkanTexture> vulkan_create_screenshot_texture(uint32_t width, uint32_t height, uint32_t drmFormat, bool exportable)
 {
@@ -3450,8 +3402,8 @@ void vulkan_screenshot( const struct FrameInfo_t *frameInfo, std::shared_ptr<CVu
 
 	cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
-	g_device.wait(sequence);
+	cmdBuffer->submit();
+	cmdBuffer->wait();
 }
 
 void vulkan_screenshot( std::shared_ptr<CVulkanTexture> compositeImage, std::shared_ptr<CVulkanTexture> pScreenshotTexture )
@@ -3501,8 +3453,8 @@ void vulkan_screenshot( std::shared_ptr<CVulkanTexture> compositeImage, std::sha
 		cmdBuffer->dispatch(div_roundup(pScreenshotTexture->width(), dispatchSize), div_roundup(pScreenshotTexture->height(), dispatchSize));
 	}
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
-	g_device.wait(sequence);
+	cmdBuffer->submit();
+	cmdBuffer->wait();
 }
 
 std::shared_ptr<CVulkanTexture> vulkan_composite( const struct FrameInfo_t *frameInfo )
@@ -3647,8 +3599,8 @@ std::shared_ptr<CVulkanTexture> vulkan_composite( const struct FrameInfo_t *fram
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
-	g_device.wait(sequence);
+	cmdBuffer->submit();
+	cmdBuffer->wait();
 
 	return compositeImage;
 }
@@ -3850,9 +3802,8 @@ std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wl
 	cmdBuffer->copyBufferToImage( buffer, 0, stride / DRMFormatGetBPP(drmFormat), pTex);
 	// TODO: Sync this copyBufferToImage
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
-
-	g_device.wait(sequence);
+	cmdBuffer->submit();
+	cmdBuffer->wait();
 
 	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
 	g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);

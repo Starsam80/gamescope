@@ -7181,8 +7181,6 @@ steamcompmgr_main(int argc, char **argv)
 			XFlush(root_ctx->dpy);
 		}
 
-		vulkan_garbage_collect();
-
 		vblank = false;
 	}
 

@@ -328,7 +328,6 @@ void vulkan_present_to_window( void );
 void vulkan_present_to_openvr( std::shared_ptr<CVulkanTexture> texture );
 #endif
 
-void vulkan_garbage_collect( void );
 bool vulkan_remake_swapchain( void );
 bool vulkan_remake_output_images( void );
 bool acquire_next_image( void );
