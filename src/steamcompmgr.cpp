@@ -2555,15 +2555,7 @@ paint_all(bool async)
 
 	if ( takeScreenshot )
 	{
-		constexpr bool bHackForceNV12DumpScreenshot = false;
-
-		uint32_t drmCaptureFormat = bHackForceNV12DumpScreenshot
-			? DRM_FORMAT_NV12
-			: DRM_FORMAT_XRGB8888;
-
-		std::shared_ptr<CVulkanTexture> pScreenshotTexture = vulkan_acquire_screenshot_texture(g_nOutputWidth, g_nOutputHeight, false, drmCaptureFormat);
-
-		assert( pScreenshotTexture != nullptr );
+		std::shared_ptr<CVulkanTexture> pScreenshotTexture = vulkan_acquire_screenshot_texture(g_nOutputWidth, g_nOutputHeight, DRM_FORMAT_XRGB8888);
 
 		// Basically no color mgmt applied for screenshots. (aside from being able to handle HDR content with LUTs)
 		for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )

@@ -348,7 +348,6 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
-	int buffers = 4;
 	int shm_size = state->shm_stride * state->video_info.size.height;
 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
 		shm_size += ((state->video_info.size.height + 1) / 2) * state->shm_stride;
@@ -358,7 +357,7 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 8),
+		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 32),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
@@ -473,8 +472,8 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
 
-	buffer->texture = vulkan_acquire_screenshot_texture(s_nCaptureWidth, s_nCaptureHeight, is_dmabuf, drmFormat, colorspace);
-	assert(buffer->texture != nullptr);
+	buffer->texture = vulkan_create_screenshot_texture(s_nCaptureWidth, s_nCaptureHeight, drmFormat, is_dmabuf);
+	buffer->texture->setStreamColorspace(colorspace);
 
 	if (is_dmabuf) {
 		const struct wlr_dmabuf_attributes dmabuf = buffer->texture->dmabuf();

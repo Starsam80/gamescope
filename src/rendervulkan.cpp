@@ -107,7 +107,7 @@ struct VulkanOutput_t
 
 	VkFormat outputFormat = VK_FORMAT_UNDEFINED;
 
-	std::array<std::shared_ptr<CVulkanTexture>, 8> pScreenshotImages;
+	std::shared_ptr<CVulkanTexture> pScreenshotImage;
 
 	// NIS and FSR
 	std::shared_ptr<CVulkanTexture> tmpOutput;
@@ -2967,8 +2967,7 @@ bool vulkan_remake_swapchain( void )
 	g_device.vk.DestroySwapchainKHR( g_device.device(), pOutput->swapChain, nullptr );
 
 	// Delete screenshot image to be remade if needed
-	for (auto& pScreenshotImage : pOutput->pScreenshotImages)
-		pScreenshotImage = nullptr;
+	pOutput->pScreenshotImage = nullptr;
 
 	bool bRet = vulkan_make_swapchain( pOutput );
 	assert( bRet ); // Something has gone horribly wrong!
@@ -3018,8 +3017,7 @@ bool vulkan_remake_output_images()
 	pOutput->nOutImage = 0;
 
 	// Delete screenshot image to be remade if needed
-	for (auto& pScreenshotImage : pOutput->pScreenshotImages)
-		pScreenshotImage = nullptr;
+	pOutput->pScreenshotImage = nullptr;
 
 	bool bRet = vulkan_make_output_images( pOutput );
 	assert( bRet );
@@ -3266,37 +3264,33 @@ void vulkan_garbage_collect( void )
 	g_device.garbageCollect();
 }
 
-std::shared_ptr<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace)
+std::shared_ptr<CVulkanTexture> vulkan_create_screenshot_texture(uint32_t width, uint32_t height, uint32_t drmFormat, bool exportable)
 {
-	for (auto& pScreenshotImage : g_output.pScreenshotImages)
-	{
-		if (pScreenshotImage == nullptr)
-		{
-			pScreenshotImage = std::make_shared<CVulkanTexture>();
+	std::shared_ptr<CVulkanTexture> pTex = std::make_shared<CVulkanTexture>();
 
-			CVulkanTexture::createFlags screenshotImageFlags;
-			screenshotImageFlags.bMappable = true;
-			screenshotImageFlags.bTransferDst = true;
-			screenshotImageFlags.bStorage = true;
-			if (exportable || drmFormat == DRM_FORMAT_NV12) {
-				screenshotImageFlags.bExportable = true;
-				screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
-			}
-
-			bool bSuccess = pScreenshotImage->BInit( width, height, 1u, drmFormat, screenshotImageFlags );
-			pScreenshotImage->setStreamColorspace(colorspace);
-
-			assert( bSuccess );
-		}
-
-		if (pScreenshotImage.use_count() > 1 || width != pScreenshotImage->width() || height != pScreenshotImage->height())
-			continue;
-
-		return pScreenshotImage;
+	CVulkanTexture::createFlags flags;
+	flags.bTransferDst = true;
+	flags.bStorage = true;
+	flags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+	if (exportable) {
+		flags.bExportable = true;
+	} else {
+		flags.bMappable = true;
 	}
 
-	vk_log.errorf("Unable to acquire screenshot texture. Out of textures.");
-	return nullptr;
+	assert( pTex->BInit( width, height, 1u, drmFormat, flags ) );
+
+	return pTex;
+}
+
+std::shared_ptr<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, uint32_t drmFormat)
+{
+	auto& pScreenshotImage = g_output.pScreenshotImage;
+	if ( pScreenshotImage == nullptr || pScreenshotImage->width() != width || pScreenshotImage->height() != height)
+	{
+		pScreenshotImage = vulkan_create_screenshot_texture(width, height, drmFormat);
+	}
+	return pScreenshotImage;
 }
 
 // Internal display's native brightness.
