@@ -319,14 +319,13 @@ std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dm
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf );
 
-bool vulkan_composite( const struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
-std::shared_ptr<CVulkanTexture> vulkan_get_last_output_image( void );
+std::shared_ptr<CVulkanTexture> vulkan_composite( const struct FrameInfo_t *frameInfo );
 std::shared_ptr<CVulkanTexture> vulkan_create_screenshot_texture(uint32_t width, uint32_t height, uint32_t drmFormat, bool exportable = false);
 std::shared_ptr<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, uint32_t drmFormat);
 
 void vulkan_present_to_window( void );
 #if HAVE_OPENVR
-void vulkan_present_to_openvr( void );
+void vulkan_present_to_openvr( std::shared_ptr<CVulkanTexture> texture );
 #endif
 
 void vulkan_garbage_collect( void );
@@ -341,7 +340,8 @@ std::shared_ptr<CVulkanTexture> vulkan_create_1d_lut(uint32_t size);
 std::shared_ptr<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t height, uint32_t depth);
 void vulkan_update_luts(const std::shared_ptr<CVulkanTexture>& lut1d, const std::shared_ptr<CVulkanTexture>& lut3d, void* lut1d_data, void* lut3d_data);
 
-bool vulkan_screenshot( const struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
+void vulkan_screenshot( const struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
+void vulkan_screenshot( std::shared_ptr<CVulkanTexture> compositeImage, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
 
 struct wlr_renderer *vulkan_renderer_create( void );
 

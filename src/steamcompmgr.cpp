@@ -2380,11 +2380,6 @@ paint_all(bool async)
 	bool propertyRequestedScreenshot = g_bPropertyRequestedScreenshot;
 	g_bPropertyRequestedScreenshot = false;
 
-	struct pipewire_buffer *pw_buffer = nullptr;
-#if HAVE_PIPEWIRE
-	pw_buffer = dequeue_pipewire_buffer();
-#endif
-
 	int nDynamicRefresh = g_nDynamicRefreshRate[drm_get_screen_type( &g_DRM )];
 
 	int nTargetRefresh = nDynamicRefresh && steamcompmgr_window_should_limit_fps( global_focus.focusWindow )// && !global_focus.overlayWindow
@@ -2404,7 +2399,6 @@ paint_all(bool async)
 
 	bool bNeedsComposite = BIsNested();
 	bNeedsComposite |= alwaysComposite;
-	bNeedsComposite |= pw_buffer != nullptr;
 	bNeedsComposite |= bWasFirstFrame;
 	bNeedsComposite |= frameInfo.useFSRLayer0;
 	bNeedsComposite |= frameInfo.useNISLayer0;
@@ -2412,6 +2406,11 @@ paint_all(bool async)
 	bNeedsComposite |= bNeedsNearest;
 	bNeedsComposite |= bDrewCursor;
 	bNeedsComposite |= g_bColorSliderInUse;
+
+#if HAVE_PIPEWIRE
+	struct pipewire_buffer *pw_buffer = dequeue_pipewire_buffer();
+	bNeedsComposite |= pw_buffer != nullptr;
+#endif
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 	{
@@ -2444,27 +2443,22 @@ paint_all(bool async)
 
 	if ( bDoComposite == true )
 	{
-		std::shared_ptr<CVulkanTexture> pPipewireTexture = nullptr;
+		auto compositeImage = vulkan_composite( &frameInfo );
+
 #if HAVE_PIPEWIRE
 		if ( pw_buffer != nullptr )
 		{
-			pPipewireTexture = pw_buffer->texture;
+			vulkan_screenshot(compositeImage, pw_buffer->texture);
+			push_pipewire_buffer(pw_buffer);
 		}
 #endif
-		bool bResult = vulkan_composite( &frameInfo, pPipewireTexture );
-
-		if ( bResult != true )
-		{
-			xwm_log.errorf("vulkan_composite failed");
-			return;
-		}
 
 		if ( BIsNested() == true )
 		{
 #if HAVE_OPENVR
 			if ( BIsVRSession() )
 			{
-				vulkan_present_to_openvr();
+				vulkan_present_to_openvr(compositeImage);
 			}
 			else if ( BIsSDLSession() )
 #endif
@@ -2486,7 +2480,7 @@ paint_all(bool async)
 			layer->scale.y = 1.0;
 			layer->opacity = 1.0;
 
-			layer->tex = vulkan_get_last_output_image();
+			layer->tex = compositeImage;
 			layer->fbid = layer->tex->fbid();
 			layer->applyColorMgmt = false;
 
@@ -2536,15 +2530,6 @@ paint_all(bool async)
 
 			drm_commit( &g_DRM, &compositeFrameInfo );
 		}
-
-#if HAVE_PIPEWIRE
-		if ( pw_buffer != nullptr )
-		{
-			push_pipewire_buffer(pw_buffer);
-			// TODO: make sure the pw_buffer isn't lost in one of the failure
-			// code-paths above
-		}
-#endif
 	}
 	else
 	{
@@ -2573,12 +2558,7 @@ paint_all(bool async)
 			}
 		}
 
-		bool bResult = vulkan_screenshot( &frameInfo, pScreenshotTexture );
-		if ( bResult != true )
-		{
-			xwm_log.errorf("vulkan_screenshot failed");
-			return;
-		}
+		vulkan_screenshot( &frameInfo, pScreenshotTexture );
 
 		std::thread screenshotThread = std::thread([=] {
 			pthread_setname_np( pthread_self(), "gamescope-scrsh" );
