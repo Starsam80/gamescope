@@ -2596,9 +2596,9 @@ paint_all(bool async)
 					for (uint32_t x = 0; x < currentOutputWidth; x++)
 					{
 						// BGR...
-						imageData[y * pitch + x * comp + 0] = mappedData[y * pScreenshotTexture->rowPitch() + x * comp + 2];
-						imageData[y * pitch + x * comp + 1] = mappedData[y * pScreenshotTexture->rowPitch() + x * comp + 1];
-						imageData[y * pitch + x * comp + 2] = mappedData[y * pScreenshotTexture->rowPitch() + x * comp + 0];
+						imageData[y * pitch + x * comp + 0] = mappedData[y * pScreenshotTexture->planeLayout().rowPitch + x * comp + 2];
+						imageData[y * pitch + x * comp + 1] = mappedData[y * pScreenshotTexture->planeLayout().rowPitch + x * comp + 1];
+						imageData[y * pitch + x * comp + 2] = mappedData[y * pScreenshotTexture->planeLayout().rowPitch + x * comp + 0];
 						imageData[y * pitch + x * comp + 3] = 255;
 					}
 				}

@@ -6,7 +6,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <algorithm>
-#include <array>
 #include <bitset>
 #include <thread>
 #include <vulkan/vulkan_core.h>
@@ -2045,6 +2044,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	m_bExternal = pDMA || flags.bExportable == true;
 
+	m_format = DRMFormatToVulkan(drmFormat, false);
+	assert( m_format != VK_FORMAT_UNDEFINED );
+
 	// Possible extensions for below
 	wsi_image_create_info wsiImageCreateInfo = {};
 	VkExternalMemoryImageCreateInfo externalImageCreateInfo = {};
@@ -2055,7 +2057,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkImageCreateInfo imageInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = flags.imageType,
-		.format = DRMFormatToVulkan(drmFormat, false),
+		.format = m_format,
 		.extent = {
 			.width = width,
 			.height = height,
@@ -2068,8 +2070,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.usage = usage,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	};
-
-	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
 	std::array<VkFormat, 2> formats = {
 		DRMFormatToVulkan(drmFormat, false),
@@ -2085,6 +2085,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	if ( formats[0] != formats[1] )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
+		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	}
+
+	if ( isYcbcr() && flags.bStorage ) {
 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	}
 
@@ -2127,7 +2131,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	}
 
 	std::vector<uint64_t> modifiers = {};
-	if ( flags.bFlippable == true && g_device.supportsModifiers() && !pDMA )
+	if ( flags.bExportable == true && g_device.supportsModifiers() && !pDMA )
 	{
 		assert( drmFormat != DRM_FORMAT_INVALID );
 
@@ -2169,16 +2173,17 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			modifiers.push_back( modifier );
 		}
 
-		assert( modifiers.size() > 0 );
+		if ( modifiers.size() > 0 )
+		{
+			modifierListInfo = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+				.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
+				.drmFormatModifierCount = uint32_t(modifiers.size()),
+				.pDrmFormatModifiers = modifiers.data(),
+			};
 
-		modifierListInfo = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-			.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
-			.drmFormatModifierCount = uint32_t(modifiers.size()),
-			.pDrmFormatModifiers = modifiers.data(),
-		};
-
-		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+			imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+		}
 	}
 
 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
@@ -2214,8 +2219,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		m_contentWidth = width;
 		m_contentHeight = height;
 	}
-
-	m_format = imageInfo.format;
 
 	res = g_device.vk.CreateImage(g_device.device(), &imageInfo, nullptr, &m_vkImage);
 	if (res != VK_SUCCESS) {
@@ -2303,39 +2306,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		return false;
 	}
 
-	if ( flags.bMappable == true )
-	{
-		assert( tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT );
-		const VkImageSubresource image_subresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		};
-		VkSubresourceLayout image_layout;
-		g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &image_subresource, &image_layout);
-
-		m_unRowPitch = image_layout.rowPitch;
-
-		if (isYcbcr())
-		{
-			const VkImageSubresource lumaSubresource = {
-				.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT,
-			};
-			VkSubresourceLayout lumaLayout;
-			g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &lumaSubresource, &lumaLayout);
-
-			m_lumaOffset = lumaLayout.offset;
-			m_lumaPitch = lumaLayout.rowPitch;
-
-			const VkImageSubresource chromaSubresource = {
-				.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT,
-			};
-			VkSubresourceLayout chromaLayout;
-			g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &chromaSubresource, &chromaLayout);
-
-			m_chromaOffset = chromaLayout.offset;
-			m_chromaPitch = chromaLayout.rowPitch;
-		}
-	}
-	
 	if ( flags.bExportable == true )
 	{
 		// We assume we own the memory when doing this right now.
@@ -2343,12 +2313,12 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		// already have a DMA-BUF in that case).
 		assert( pDMA == nullptr );
 
-		struct wlr_dmabuf_attributes dmabuf = {
+		assert( drmFormat != DRM_FORMAT_INVALID );
+		m_dmabuf = {
 			.width = int(width),
 			.height = int(height),
 			.format = drmFormat,
 		};
-		assert( dmabuf.format != DRM_FORMAT_INVALID );
 
 		// TODO: disjoint planes support
 		const VkMemoryGetFdInfoKHR memory_get_fd_info = {
@@ -2356,7 +2326,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.memory = m_vkImageMemory,
 			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 		};
-		res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &dmabuf.fd[0]);
+		res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &m_dmabuf.fd[0]);
 		if ( res != VK_SUCCESS ) {
 			vk_errorf( res, "vkGetMemoryFdKHR failed" );
 			return false;
@@ -2375,57 +2345,55 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				vk_errorf( res, "vkGetImageDrmFormatModifierPropertiesEXT failed" );
 				return false;
 			}
-			dmabuf.modifier = imgModifierProps.drmFormatModifier;
+			m_dmabuf.modifier = imgModifierProps.drmFormatModifier;
 
 			assert( DRMModifierProps.count( m_format ) > 0);
-			assert( DRMModifierProps[ m_format ].count( dmabuf.modifier ) > 0);
+			assert( DRMModifierProps[ m_format ].count( m_dmabuf.modifier ) > 0);
 
-			dmabuf.n_planes = DRMModifierProps[ m_format ][ dmabuf.modifier ].drmFormatModifierPlaneCount;
-
-			const VkImageAspectFlagBits planeAspects[] = {
-				VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
-				VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
-				VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
-				VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT,
-			};
-			assert( dmabuf.n_planes <= 4 );
-
-			for ( int i = 0; i < dmabuf.n_planes; i++ )
-			{
-				const VkImageSubresource subresource = {
-					.aspectMask = planeAspects[i],
-				};
-				VkSubresourceLayout subresourceLayout = {};
-				g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
-				dmabuf.offset[i] = subresourceLayout.offset;
-				dmabuf.stride[i] = subresourceLayout.rowPitch;
-			}
-
-			// Copy the first FD to all other planes
-			for ( int i = 1; i < dmabuf.n_planes; i++ )
-			{
-				dmabuf.fd[i] = dup( dmabuf.fd[0] );
-				if ( dmabuf.fd[i] < 0 ) {
-					vk_log.errorf_errno( "dup failed" );
-					return false;
-				}
-			}
+			m_dmabuf.n_planes = DRMModifierProps[ m_format ][ m_dmabuf.modifier ].drmFormatModifierPlaneCount;
+			assert( m_dmabuf.n_planes <= 4 );
 		}
 		else
 		{
-			const VkImageSubresource subresource = {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			};
-			VkSubresourceLayout subresourceLayout = {};
-			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
-
-			dmabuf.n_planes = 1;
-			dmabuf.modifier = DRM_FORMAT_MOD_INVALID;
-			dmabuf.offset[0] = 0;
-			dmabuf.stride[0] = subresourceLayout.rowPitch;
+			m_dmabuf.modifier = DRM_FORMAT_MOD_INVALID;
+			m_dmabuf.n_planes = isYcbcr() ? 2 : 1;
 		}
 
-		m_dmabuf = dmabuf;
+		// Copy the first FD to all other planes
+		for ( int i = 1; i < m_dmabuf.n_planes; i++ )
+		{
+			m_dmabuf.fd[i] = dup( m_dmabuf.fd[0] );
+			if ( m_dmabuf.fd[i] < 0 ) {
+				vk_log.errorf_errno( "dup failed" );
+				return false;
+			}
+		}
+	}
+
+	if ( flags.bMappable == true || flags.bExportable == true )
+	{
+		const bool is_drm = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+		assert( is_drm || tiling == VK_IMAGE_TILING_LINEAR );
+
+		const int n_planes = is_drm ? m_dmabuf.n_planes : isYcbcr() ? 2 : 1;
+		const VkImageAspectFlagBits planeAspects[] = {
+			is_drm ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT : n_planes > 1 ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+			is_drm ? VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT : VK_IMAGE_ASPECT_PLANE_1_BIT,
+			is_drm ? VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT : VK_IMAGE_ASPECT_PLANE_2_BIT,
+			is_drm ? VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT : VK_IMAGE_ASPECT_NONE,
+		};
+		for ( int i = 0; i < n_planes; i++ )
+		{
+			const VkImageSubresource subresource = {
+				.aspectMask = planeAspects[i],
+			};
+			g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &subresource, &m_imageLayout[i]);
+			if ( flags.bExportable == true )
+			{
+				m_dmabuf.offset[i] = m_imageLayout[i].offset;
+				m_dmabuf.stride[i] = m_imageLayout[i].rowPitch;
+			}
+		}
 	}
 
 	if ( flags.bFlippable == true )
@@ -3271,7 +3239,7 @@ std::shared_ptr<CVulkanTexture> vulkan_create_screenshot_texture(uint32_t width,
 	CVulkanTexture::createFlags flags;
 	flags.bTransferDst = true;
 	flags.bStorage = true;
-	flags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+	flags.bLinear = true;
 	if (exportable) {
 		flags.bExportable = true;
 	} else {

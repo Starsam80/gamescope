@@ -29,16 +29,7 @@ struct pipewire_state {
  * push_pipewire_buffer) for copying.
  */
 struct pipewire_buffer {
-	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
-	struct spa_video_info_raw video_info;
 	std::shared_ptr<CVulkanTexture> texture;
-
-	// Only used for SPA_DATA_MemFd
-	struct {
-		int stride;
-		uint8_t *data;
-		int fd;
-	} shm;
 
 	// The following fields are not thread-safe
 
