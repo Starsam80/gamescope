@@ -2408,8 +2408,7 @@ paint_all(bool async)
 	bNeedsComposite |= g_bColorSliderInUse;
 
 #if HAVE_PIPEWIRE
-	struct pipewire_buffer *pw_buffer = dequeue_pipewire_buffer();
-	bNeedsComposite |= pw_buffer != nullptr;
+	bNeedsComposite |= pipewire_is_streaming();
 #endif
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
@@ -2446,11 +2445,7 @@ paint_all(bool async)
 		auto compositeImage = vulkan_composite( &frameInfo );
 
 #if HAVE_PIPEWIRE
-		if ( pw_buffer != nullptr )
-		{
-			vulkan_screenshot(compositeImage, pw_buffer->texture);
-			push_pipewire_buffer(pw_buffer);
-		}
+		pipewire_copy_texture(compositeImage, !BIsHeadless());
 #endif
 
 		if ( BIsNested() == true )

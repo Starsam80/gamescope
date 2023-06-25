@@ -9,12 +9,18 @@
 #include "log.hpp"
 #include "main.hpp"
 #include "pipewire.hpp"
+#include "rendervulkan.hpp"
 
 #include <spa/debug/types.h>
 
 static LogScope pwr_log("pipewire");
 
 static struct pipewire_state pipewire_state{};
+
+struct buffer_data
+{
+	std::shared_ptr<CVulkanTexture> texture;
+};
 
 class pipewire_lock
 {
@@ -28,10 +34,8 @@ private:
 	struct pw_thread_loop *m_thread;
 };
 
-// Pending buffer for PipeWire → steamcompmgr
-static std::atomic<struct pipewire_buffer *> out_buffer;
 // Pending buffer for steamcompmgr → PipeWire
-static std::atomic<struct pipewire_buffer *> in_buffer;
+static std::atomic<std::shared_ptr<CVulkanTexture>> in_buffer;
 
 static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder)
 {
@@ -81,35 +85,29 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 	};
 }
 
-static void request_buffer(struct pipewire_state *state)
+static void copy_texture(struct pipewire_state *state, const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue)
 {
+	if (!state->streaming) {
+		return;
+	}
+
+	if (queue) {
+		in_buffer = compositeImage;
+		pw_stream_trigger_process(state->stream);
+		return;
+	}
+
+	pipewire_lock lock(state->thread);
+
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
 	if (!pw_buffer) {
 		pwr_log.errorf("warning: out of buffers");
 		return;
 	}
 
-	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
-	buffer->copying = true;
-
-	// Past this exchange, the PipeWire thread shares the buffer with the
-	// steamcompmgr thread
-	struct pipewire_buffer *old = out_buffer.exchange(buffer);
-	assert(old == nullptr);
-}
-
-static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *buffer)
-{
-	buffer->copying = false;
-
-	struct pw_buffer *pw_buffer = buffer->buffer;
-	if (!pw_buffer) {
-		delete buffer;
-		return;
-	}
-
-	const auto& tex = buffer->texture;
-	assert(tex != nullptr);
+	struct buffer_data *extra_data = (struct buffer_data *) pw_buffer->user_data;
+	const auto& tex = extra_data->texture;
+	vulkan_screenshot(compositeImage, tex);
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 
@@ -166,12 +164,8 @@ static void stream_handle_process(void *data)
 {
 	struct pipewire_state *state = (struct pipewire_state *) data;
 
-	struct pipewire_buffer *buffer = in_buffer.exchange(nullptr);
-	if (buffer != nullptr) {
-		// We now completely own the buffer, it's no longer shared with the
-		// steamcompmgr thread.
-
-		copy_buffer(state, buffer);
+	if (auto compositeImage = in_buffer.exchange(nullptr)) {
+		copy_texture(state, compositeImage, false);
 	}
 }
 
@@ -306,9 +300,8 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 {
 	struct pipewire_state *state = (struct pipewire_state *) user_data;
 
-	struct pipewire_buffer *extra_data = new pipewire_buffer();
+	struct buffer_data *extra_data = new buffer_data();
 	pw_buffer->user_data = extra_data;
-	extra_data->buffer = pw_buffer;
 
 	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
 
@@ -367,12 +360,8 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
-	struct pipewire_buffer *extra_data = (struct pipewire_buffer *) pw_buffer->user_data;
-	extra_data->buffer = nullptr;
-
-	if (!extra_data->copying) {
-		delete extra_data;
-	}
+	struct buffer_data *extra_data = (struct buffer_data *) pw_buffer->user_data;
+	delete extra_data;
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 	for (uint32_t i = 0; i < spa_buffer->n_datas; i++) {
@@ -485,20 +474,16 @@ uint32_t get_pipewire_stream_node_id(void)
 	return pipewire_state.stream_node_id;
 }
 
-struct pipewire_buffer *dequeue_pipewire_buffer(void)
+bool pipewire_is_streaming(void)
 {
 	struct pipewire_state *state = &pipewire_state;
-	if (state->streaming) {
-		request_buffer(state);
-	}
-	return out_buffer.exchange(nullptr);
+	return state->streaming;
 }
 
-void push_pipewire_buffer(struct pipewire_buffer *buffer)
+void pipewire_copy_texture(const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue)
 {
-	struct pipewire_buffer *old = in_buffer.exchange(buffer);
-	assert(old == nullptr);
-	nudge_pipewire();
+	struct pipewire_state *state = &pipewire_state;
+	copy_texture(state, compositeImage, queue);
 }
 
 void nudge_pipewire(void)

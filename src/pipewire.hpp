@@ -4,7 +4,7 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 
-#include "rendervulkan.hpp"
+class CVulkanTexture;
 
 struct pipewire_state {
 	pipewire_state();
@@ -24,26 +24,9 @@ struct pipewire_state {
 	uint64_t seq;
 };
 
-/**
- * PipeWire buffers are allocated by the PipeWire thread, and are temporarily
- * shared with the steamcompmgr thread (via dequeue_pipewire_buffer and
- * push_pipewire_buffer) for copying.
- */
-struct pipewire_buffer {
-	std::shared_ptr<CVulkanTexture> texture;
-
-	// The following fields are not thread-safe
-
-	// The PipeWire buffer, or nullptr if it's been destroyed.
-	struct pw_buffer *buffer;
-	// We pass the buffer to the steamcompmgr thread for copying. This is set
-	// to true if the buffer is currently owned by the steamcompmgr thread.
-	bool copying;
-};
-
 bool init_pipewire(void);
 uint32_t get_pipewire_stream_node_id(void);
-struct pipewire_buffer *dequeue_pipewire_buffer(void);
-void push_pipewire_buffer(struct pipewire_buffer *buffer);
+bool pipewire_is_streaming(void);
+void pipewire_copy_texture(const std::shared_ptr<CVulkanTexture>& compositeImage, bool queue);
 void nudge_pipewire(void);
 void pipewire_resize_output(uint32_t width, uint32_t height);
