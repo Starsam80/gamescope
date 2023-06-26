@@ -7,13 +7,15 @@
 #include "rendervulkan.hpp"
 
 struct pipewire_state {
-	struct pw_loop *loop;
+	pipewire_state();
+	~pipewire_state();
+
+	struct pw_thread_loop *thread;
 	struct pw_context *context;
 	struct pw_core *core;
-	bool running;
 
 	struct pw_stream *stream;
-	uint32_t stream_node_id;
+	uint32_t stream_node_id = SPA_ID_INVALID;
 	bool streaming;
 	struct spa_video_info_raw video_info;
 	bool dmabuf;

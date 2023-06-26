@@ -1,12 +1,10 @@
 #include <assert.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
-#include <thread>
 #include <vector>
 
 #include "main.hpp"
@@ -16,8 +14,19 @@
 
 static LogScope pwr_log("pipewire");
 
-static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
-static int nudgePipe[2] = { -1, -1 };
+static struct pipewire_state pipewire_state{};
+
+class pipewire_lock
+{
+public:
+	pipewire_lock(struct pw_thread_loop *thread): m_thread(thread) { pw_thread_loop_lock(m_thread); }
+	~pipewire_lock() { pw_thread_loop_unlock(m_thread); }
+
+	int iterate(int timeout = -1) { return pw_loop_iterate(pw_thread_loop_get_loop(m_thread), timeout); }
+
+private:
+	struct pw_thread_loop *m_thread;
+};
 
 // Pending buffer for PipeWire → steamcompmgr
 static std::atomic<struct pipewire_buffer *> out_buffer;
@@ -243,16 +252,9 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 	}
 }
 
-static void dispatch_nudge(struct pipewire_state *state, int fd)
+static void stream_handle_process(void *data)
 {
-	while (true) {
-		static char buf[1024];
-		if (read(fd, buf, sizeof(buf)) < 0) {
-			if (errno != EAGAIN)
-				pwr_log.errorf_errno("dispatch_nudge: read failed");
-			break;
-		}
-	}
+	struct pipewire_state *state = (struct pipewire_state *) data;
 
 	if (g_nOutputWidth != s_nOutputWidth || g_nOutputHeight != s_nOutputHeight) {
 		s_nOutputWidth = g_nOutputWidth;
@@ -307,10 +309,6 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 		break;
 	case PW_STREAM_STATE_STREAMING:
 		state->streaming = true;
-		break;
-	case PW_STREAM_STATE_ERROR:
-	case PW_STREAM_STATE_UNCONNECTED:
-		state->running = false;
 		break;
 	default:
 		break;
@@ -559,82 +557,47 @@ static const struct pw_stream_events stream_events = {
 	.param_changed = stream_handle_param_changed,
 	.add_buffer = stream_handle_add_buffer,
 	.remove_buffer = stream_handle_remove_buffer,
-	.process = nullptr,
+	.process = stream_handle_process,
 };
 
-enum pipewire_event_type {
-	EVENT_PIPEWIRE,
-	EVENT_NUDGE,
-	EVENT_COUNT // keep last
-};
-
-static void run_pipewire(struct pipewire_state *state)
+pipewire_state::pipewire_state()
 {
-	pthread_setname_np( pthread_self(), "gamescope-pw" );
+	pw_init(nullptr, nullptr);
+}
 
-	struct pollfd pollfds[] = {
-		[EVENT_PIPEWIRE] = {
-			.fd = pw_loop_get_fd(state->loop),
-			.events = POLLIN,
-		},
-		[EVENT_NUDGE] = {
-			.fd = nudgePipe[0],
-			.events = POLLIN,
-		},
-	};
-
-	while (state->running) {
-		int ret = poll(pollfds, EVENT_COUNT, -1);
-		if (ret < 0) {
-			pwr_log.errorf_errno("poll failed");
-			break;
+pipewire_state::~pipewire_state()
+{
+	struct pipewire_state *state = this;
+	if (state->thread) {
+		pw_thread_loop_stop(state->thread);
+		if (state->stream) {
+			pw_stream_destroy(state->stream);
 		}
-
-		if (pollfds[EVENT_PIPEWIRE].revents & POLLHUP) {
-			pwr_log.errorf("lost connection to server");
-			break;
+		if (state->core) {
+			pw_core_disconnect(state->core);
 		}
-
-		assert(!(pollfds[EVENT_NUDGE].revents & POLLHUP));
-
-		if (pollfds[EVENT_PIPEWIRE].revents & POLLIN) {
-			ret = pw_loop_iterate(state->loop, -1);
-			if (ret < 0) {
-				pwr_log.errorf("pw_loop_iterate failed");
-				break;
-			}
+		if (state->context) {
+			pw_context_destroy(state->context);
 		}
-
-		if (pollfds[EVENT_NUDGE].revents & POLLIN) {
-			dispatch_nudge(state, nudgePipe[0]);
-		}
+		pw_thread_loop_destroy(state->thread);
 	}
-
-	pwr_log.infof("exiting");
-	pw_stream_destroy(state->stream);
-	pw_core_disconnect(state->core);
-	pw_context_destroy(state->context);
-	pw_loop_destroy(state->loop);
+	pw_deinit();
 }
 
 bool init_pipewire(void)
 {
 	struct pipewire_state *state = &pipewire_state;
 
-	pw_init(nullptr, nullptr);
-
-	if (pipe2(nudgePipe, O_CLOEXEC | O_NONBLOCK) != 0) {
-		pwr_log.errorf_errno("pipe2 failed");
+	state->thread = pw_thread_loop_new("gamescope-pw", nullptr);
+	if (!state->thread) {
+		pwr_log.errorf("pw_thread_loop_new failed");
 		return false;
 	}
 
-	state->loop = pw_loop_new(nullptr);
-	if (!state->loop) {
-		pwr_log.errorf("pw_loop_new failed");
-		return false;
-	}
+	pipewire_lock lock(state->thread);
+	pw_thread_loop_start(state->thread);
 
-	state->context = pw_context_new(state->loop, nullptr, 0);
+	state->context = pw_context_new(pw_thread_loop_get_loop(state->thread), nullptr, 0);
 	if (!state->context) {
 		pwr_log.errorf("pw_context_new failed");
 		return false;
@@ -675,19 +638,14 @@ bool init_pipewire(void)
 		return false;
 	}
 
-	state->running = true;
 	while (state->stream_node_id == SPA_ID_INVALID) {
-		int ret = pw_loop_iterate(state->loop, -1);
-		if (ret < 0) {
+		if (lock.iterate() < 0) {
 			pwr_log.errorf("pw_loop_iterate failed");
 			return false;
 		}
 	}
 
 	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
-
-	std::thread thread(run_pipewire, state);
-	thread.detach();
 
 	return true;
 }
@@ -715,6 +673,6 @@ void push_pipewire_buffer(struct pipewire_buffer *buffer)
 
 void nudge_pipewire(void)
 {
-	if (write(nudgePipe[1], "\n", 1) < 0)
-		pwr_log.errorf_errno("nudge_pipewire: write failed");
+	struct pipewire_state *state = &pipewire_state;
+	pw_stream_trigger_process(state->stream);
 }
