@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+#include <array>
 #include <atomic>
 #include <vector>
 
@@ -61,75 +62,53 @@ static void calculate_capture_size()
 	}
 }
 
-static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params) {
-	struct spa_rectangle size = SPA_RECTANGLE(s_nCaptureWidth, s_nCaptureHeight);
-	struct spa_rectangle min_requested_size = { 0, 0 };
-	struct spa_rectangle max_requested_size = { UINT32_MAX, UINT32_MAX };
-	struct spa_fraction framerate = SPA_FRACTION(0, 1);
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
-
-	struct spa_pod_frame obj_frame, choice_frame;
-	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-	spa_pod_builder_add(builder,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
-		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
-		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
-		0);
-	if (format == SPA_VIDEO_FORMAT_NV12) {
-		spa_pod_builder_add(builder,
-			SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT709),
-			SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_0_255),
-			0);
-	}
-	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
-	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
-	spa_pod_builder_long(builder, modifier); // default
-	spa_pod_builder_long(builder, modifier);
-	spa_pod_builder_pop(builder, &choice_frame);
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
-
-	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-	spa_pod_builder_add(builder,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
-		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
-		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
-		0);
-	if (format == SPA_VIDEO_FORMAT_NV12) {
-		spa_pod_builder_add(builder,
-			SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT709),
-			SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_0_255),
-			0);
-	}
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
-}
-
-
 static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder)
 {
-	std::vector<const struct spa_pod *> params;
+	const struct spa_rectangle size = SPA_RECTANGLE(s_nCaptureWidth, s_nCaptureHeight);
+	const struct spa_rectangle min_size = SPA_RECTANGLE(0, 0);
+	const struct spa_rectangle max_size = SPA_RECTANGLE(INT32_MAX, INT32_MAX);
+	const struct spa_fraction framerate = SPA_FRACTION((uint32_t)g_nOutputRefresh, 1);
+	const struct spa_fraction min_framerate = SPA_FRACTION(0, 1);
+	const struct spa_fraction max_framerate = SPA_FRACTION(INT32_MAX, 1);
 
-	build_format_params(builder, SPA_VIDEO_FORMAT_BGRx, params);
-	build_format_params(builder, SPA_VIDEO_FORMAT_NV12, params);
+	const auto build = [&](enum spa_video_format format, bool modifier) {
+		struct spa_pod_frame obj_frame;
+		spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+		spa_pod_builder_add(builder,
+			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
+			SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
+			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&framerate, &min_framerate, &max_framerate),
+			SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle(&min_size, &min_size, &max_size),
+			0);
+		if (format == SPA_VIDEO_FORMAT_NV12) {
+			spa_pod_builder_add(builder,
+				SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
+					SPA_VIDEO_COLOR_MATRIX_BT601,
+					SPA_VIDEO_COLOR_MATRIX_BT601,
+					SPA_VIDEO_COLOR_MATRIX_BT709),
+				SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
+					SPA_VIDEO_COLOR_RANGE_16_235,
+					SPA_VIDEO_COLOR_RANGE_16_235,
+					SPA_VIDEO_COLOR_RANGE_0_255),
+				0);
+		}
+		if (modifier) {
+			spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+			spa_pod_builder_long(builder, DRM_FORMAT_MOD_LINEAR);
+		}
+		return (const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame);
+	};
 
-	return params;
+	return {
+		build(SPA_VIDEO_FORMAT_BGRx, true),
+		build(SPA_VIDEO_FORMAT_BGRx, false),
+		build(SPA_VIDEO_FORMAT_RGBx, true),
+		build(SPA_VIDEO_FORMAT_RGBx, false),
+		build(SPA_VIDEO_FORMAT_NV12, true),
+		build(SPA_VIDEO_FORMAT_NV12, false),
+	};
 }
 
 static void request_buffer(struct pipewire_state *state)
@@ -273,25 +252,23 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
-	const struct spa_pod *buffers_param =
+	std::array params = {
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 32),
-		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
-		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
-	const struct spa_pod *meta_param =
+			SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 32),
+			SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
+			SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type)),
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
-		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
-	const struct spa_pod *scale_param =
+			SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+			SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+			SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header))),
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_requested_size_scale),
-		SPA_PARAM_META_size, SPA_POD_Int(sizeof(float)));
-	const struct spa_pod *params[] = { buffers_param, meta_param, scale_param };
+			SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+			SPA_PARAM_META_type, SPA_POD_Id(SPA_META_requested_size_scale),
+			SPA_PARAM_META_size, SPA_POD_Int(sizeof(float))),
+	};
 
-	ret = pw_stream_update_params(state->stream, params, sizeof(params) / sizeof(params[0]));
+	ret = pw_stream_update_params(state->stream, params.data(), params.size());
 	if (ret != 0) {
 		pwr_log.errorf("pw_stream_update_params failed");
 	}
@@ -337,9 +314,29 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
 {
 	switch (spa_format)
 	{
+		case SPA_VIDEO_FORMAT_BGRx: return DRM_FORMAT_XRGB8888;
+		case SPA_VIDEO_FORMAT_RGBx: return DRM_FORMAT_XBGR8888;
 		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
-		default:
-		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
+		default: return DRM_FORMAT_INVALID;
+	}
+}
+
+EStreamColorspace spa_color_to_gamescope(enum spa_video_color_matrix matrix, enum spa_video_color_range range)
+{
+	switch (matrix) {
+	case SPA_VIDEO_COLOR_MATRIX_BT601:
+		switch (range) {
+		case SPA_VIDEO_COLOR_RANGE_16_235: return k_EStreamColorspace_BT601;
+		case SPA_VIDEO_COLOR_RANGE_0_255: return k_EStreamColorspace_BT601_Full;
+		default: return k_EStreamColorspace_Unknown;
+		}
+	case SPA_VIDEO_COLOR_MATRIX_BT709:
+		switch (range) {
+		case SPA_VIDEO_COLOR_RANGE_16_235: return k_EStreamColorspace_BT709;
+		case SPA_VIDEO_COLOR_RANGE_0_255: return k_EStreamColorspace_BT709_Full;
+		default: return k_EStreamColorspace_Unknown;
+		}
+	default: return k_EStreamColorspace_Unknown;
 	}
 }
 
@@ -359,35 +356,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	extra_data->texture = vulkan_create_screenshot_texture(s_nCaptureWidth, s_nCaptureHeight, drmFormat, is_dmabuf);
 	const auto& tex = extra_data->texture;
 
-	EStreamColorspace colorspace = k_EStreamColorspace_Unknown;
-	switch (state->video_info.color_matrix) {
-	case SPA_VIDEO_COLOR_MATRIX_BT601:
-		switch (state->video_info.color_range) {
-		case SPA_VIDEO_COLOR_RANGE_16_235:
-			colorspace = k_EStreamColorspace_BT601;
-			break;
-		case SPA_VIDEO_COLOR_RANGE_0_255:
-			colorspace = k_EStreamColorspace_BT601_Full;
-			break;
-		default:
-			break;
-		}
-		break;
-	case SPA_VIDEO_COLOR_MATRIX_BT709:
-		switch (state->video_info.color_range) {
-		case SPA_VIDEO_COLOR_RANGE_16_235:
-			colorspace = k_EStreamColorspace_BT709;
-			break;
-		case SPA_VIDEO_COLOR_RANGE_0_255:
-			colorspace = k_EStreamColorspace_BT709_Full;
-			break;
-		default:
-			break;
-		}
-		break;
-	default:
-		break;
-	}
+	EStreamColorspace colorspace = spa_color_to_gamescope(state->video_info.color_matrix, state->video_info.color_range);
 	tex->setStreamColorspace(colorspace);
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
