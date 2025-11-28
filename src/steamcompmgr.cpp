@@ -8573,10 +8573,6 @@ steamcompmgr_main(int argc, char **argv)
 			currentOutputRefresh = g_nOutputRefresh;
 			currentHDROutput = g_bOutputHDREnabled;
 			currentHDRForce = g_bForceHDRSupportDebug;
-
-#if HAVE_PIPEWIRE
-			pipewire_nudge();
-#endif
 		}
 
 		// Ask for a new surface every vblank

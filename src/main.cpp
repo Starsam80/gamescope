@@ -288,8 +288,8 @@ const char usage[] =
 
 std::atomic< bool > g_bRun{true};
 
-int g_nNestedWidth = 0;
-int g_nNestedHeight = 0;
+uint32_t g_nNestedWidth = 0;
+uint32_t g_nNestedHeight = 0;
 int g_nNestedRefresh = 0;
 int g_nNestedUnfocusedRefresh = 0;
 int g_nNestedDisplayIndex = 0;

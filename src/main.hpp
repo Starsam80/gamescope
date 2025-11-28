@@ -9,8 +9,8 @@ extern const struct option *gamescope_options;
 
 extern std::atomic< bool > g_bRun;
 
-extern int g_nNestedWidth;
-extern int g_nNestedHeight;
+extern uint32_t g_nNestedWidth;
+extern uint32_t g_nNestedHeight;
 extern int g_nNestedRefresh; // mHz
 extern int g_nNestedUnfocusedRefresh; // mHz
 extern int g_nNestedDisplayIndex;
