@@ -13,16 +13,29 @@
 #include "pipewire.hpp"
 #include "log.hpp"
 
+#include <pipewire/pipewire.h>
 #include <spa/debug/format.h>
 
 static LogScope pwr_log("pipewire");
 
-static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
+static struct pipewire_state {
+	struct pw_thread_loop *loop;
+	struct pw_stream *stream;
+	struct spa_source *nudge_source;
+	int nudge_fd;
 
-// Pending buffer for PipeWire → steamcompmgr
-static std::atomic<struct pipewire_buffer *> out_buffer;
-// Pending buffer for steamcompmgr → PipeWire
-static std::atomic<struct pipewire_buffer *> in_buffer;
+	uint32_t stream_node_id = SPA_ID_INVALID;
+	std::atomic<bool> streaming;
+
+	// Pending buffer for PipeWire → steamcompmgr
+	std::atomic<struct pipewire_buffer *> out_buffer;
+	// Pending buffer for steamcompmgr → PipeWire
+	std::atomic<struct pipewire_buffer *> in_buffer;
+
+	struct spa_video_info_raw video_info;
+	struct spa_gamescope gamescope_info;
+	uint64_t seq;
+} pipewire_state = {};
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(buffer->buffer == nullptr);
@@ -122,11 +135,11 @@ static void stream_handle_process(void *data)
 {
 	struct pipewire_state *state = (struct pipewire_state *) data;
 
-	if (out_buffer == nullptr) {
-		out_buffer = dequeue_buffer(state);
+	if (state->out_buffer == nullptr) {
+		state->out_buffer = dequeue_buffer(state);
 	}
 
-	struct pipewire_buffer *buffer = in_buffer.exchange(nullptr);
+	struct pipewire_buffer *buffer = state->in_buffer.exchange(nullptr);
 	if (buffer == nullptr) {
 		// Nothing was submitted
 		return;
@@ -205,14 +218,11 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	if (param == nullptr || id != SPA_PARAM_Format)
 		return;
 
-	struct spa_gamescope gamescope_info{};
-
-	int ret = spa_format_video_raw_parse_with_gamescope(param, &state->video_info, &gamescope_info);
+	int ret = spa_format_video_raw_parse_with_gamescope(param, &state->video_info, &state->gamescope_info);
 	if (ret < 0) {
 		pwr_log.errorf("spa_format_video_raw_parse failed");
 		return;
 	}
-	state->gamescope_info = gamescope_info;
 
 	CVulkanTexture::createFlags probeFlags;
 	probeFlags.bTransferDst = true;
@@ -382,6 +392,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
+	struct pipewire_state *state = (struct pipewire_state *) data;
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
 
 	if (buffer == nullptr) {
@@ -392,11 +403,11 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 
 	// We want to remove any references to this buffer
 	struct pipewire_buffer *other = buffer;
-	if (out_buffer.compare_exchange_strong(other, nullptr)) {
+	if (state->out_buffer.compare_exchange_strong(other, nullptr)) {
 		buffer->copying = false;
 	}
 	other = buffer;
-	if (in_buffer.compare_exchange_strong(other, nullptr)) {
+	if (state->in_buffer.compare_exchange_strong(other, nullptr)) {
 		buffer->copying = false;
 	}
 
@@ -493,7 +504,7 @@ struct pipewire_buffer *pipewire_dequeue_buffer()
 {
 	struct pipewire_state *state = &pipewire_state;
 
-	struct pipewire_buffer *buffer = out_buffer.exchange(nullptr);
+	struct pipewire_buffer *buffer = state->out_buffer.exchange(nullptr);
 	if (buffer == nullptr && state->streaming) {
 		pw_thread_loop_lock(state->loop);
 		buffer = dequeue_buffer(state);
@@ -508,7 +519,7 @@ struct pipewire_buffer *pipewire_push_buffer(struct pipewire_buffer *buffer)
 
 	buffer->pts = pw_stream_get_nsec(state->stream);
 
-	struct pipewire_buffer *old = in_buffer.exchange(buffer);
+	struct pipewire_buffer *old = state->in_buffer.exchange(buffer);
 	pipewire_nudge();
 	// This will be `nullptr` if the pipewire thread is keeping up, otherwise the
 	// compositor should reuse this old (previous) buffer

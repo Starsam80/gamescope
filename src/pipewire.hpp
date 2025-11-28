@@ -1,24 +1,11 @@
 #pragma once
 
 #include <memory>
-#include <pipewire/pipewire.h>
-#include <spa/param/video/format-utils.h>
 
 #include "rendervulkan.hpp"
 #include "pipewire_gamescope.hpp"
 
-struct pipewire_state {
-	struct pw_thread_loop *loop;
-	struct spa_source *nudge_source;
-	int nudge_fd;
-
-	struct pw_stream *stream;
-	uint32_t stream_node_id;
-	std::atomic<bool> streaming;
-	struct spa_video_info_raw video_info;
-	struct spa_gamescope gamescope_info;
-	uint64_t seq;
-};
+struct pw_buffer;
 
 /**
  * PipeWire buffers are allocated by the PipeWire thread, and are temporarily
