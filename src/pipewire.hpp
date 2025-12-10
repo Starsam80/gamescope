@@ -17,8 +17,6 @@ struct pipewire_state {
 	std::atomic<bool> streaming;
 	struct spa_video_info_raw video_info;
 	struct spa_gamescope gamescope_info;
-	bool dmabuf;
-	int shm_stride;
 	uint64_t seq;
 };
 
@@ -28,18 +26,9 @@ struct pipewire_state {
  * pipewire_push_buffer) for copying.
  */
 struct pipewire_buffer {
-	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
 	struct spa_gamescope gamescope_info;
 	gamescope::OwningRc<CVulkanTexture> texture;
 	uint64_t pts;
-
-	// Only used for SPA_DATA_MemFd
-	struct {
-		size_t size;
-		int stride;
-		uint8_t *data;
-		int fd;
-	} shm;
 
 	// The following fields are not thread-safe
 

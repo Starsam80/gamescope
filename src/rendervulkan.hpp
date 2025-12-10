@@ -175,7 +175,8 @@ public:
 	inline uint32_t depth() { return m_depth; }
 	inline uint32_t contentWidth() {return m_contentWidth; }
 	inline uint32_t contentHeight() {return m_contentHeight; }
-	inline uint32_t rowPitch() { return m_unRowPitch; }
+	inline const VkSubresourceLayout& planeLayout(size_t plane) { return m_imageLayout[plane]; }
+	inline uint32_t rowPitch() { return planeLayout(0).rowPitch; }
 	inline gamescope::IBackendFb* GetBackendFb() { return m_pBackendFb.get(); }
 	inline uint8_t *mappedData() { return m_pMappedData; }
 	inline VkFormat format() const { return m_format; }
@@ -185,11 +186,6 @@ public:
 	inline bool externalImage() { return m_bExternal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
-
-	inline uint32_t lumaOffset() const { return m_lumaOffset; }
-	inline uint32_t lumaRowPitch() const { return m_lumaPitch; }
-	inline uint32_t chromaOffset() const { return m_chromaOffset; }
-	inline uint32_t chromaRowPitch() const { return m_chromaPitch; }
 
 	inline EStreamColorspace streamColorspace() const { return m_streamColorspace; }
 	inline void setStreamColorspace(EStreamColorspace colorspace) { m_streamColorspace = colorspace; }
@@ -229,14 +225,9 @@ private:
 	uint32_t m_contentWidth = 0;
 	uint32_t m_contentHeight = 0;
 
-	uint32_t m_unRowPitch = 0;
 	VkDeviceSize m_size = 0;
+	std::array<VkSubresourceLayout, 4> m_imageLayout = {};
 
-	uint32_t m_lumaOffset = 0;
-	uint32_t m_lumaPitch = 0;
-	uint32_t m_chromaOffset = 0;
-	uint32_t m_chromaPitch = 0;
-	
 	// If this texture owns the backend Fb (ie. it's an internal texture)
 	gamescope::OwningRc<gamescope::IBackendFb> m_pBackendFb;
 

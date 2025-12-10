@@ -26,18 +26,6 @@ static std::atomic<struct pipewire_buffer *> in_buffer;
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(buffer->buffer == nullptr);
-
-	switch (buffer->type) {
-	case SPA_DATA_MemFd:
-		munmap(buffer->shm.data, buffer->shm.size);
-		close(buffer->shm.fd);
-		break;
-	case SPA_DATA_DmaBuf:
-		break; // nothing to do
-	default:
-		assert(false); // unreachable
-	}	
-
 	delete buffer;
 }
 
@@ -146,9 +134,6 @@ static void stream_handle_process(void *data)
 		return;
 	}
 
-	gamescope::OwningRc<CVulkanTexture> &tex = buffer->texture;
-	assert(tex != nullptr);
-
 	struct pw_buffer *pw_buffer = buffer->buffer;
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 
@@ -158,61 +143,6 @@ static void stream_handle_process(void *data)
 		header->flags = 0;
 		header->seq = state->seq++;
 		header->dts_offset = 0;
-	}
-
-	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
-	chunk->flags = 0;
-
-	struct wlr_dmabuf_attributes dmabuf;
-	switch (buffer->type) {
-	case SPA_DATA_MemFd:
-		chunk->offset = 0;
-		chunk->size = buffer->shm.size;
-		chunk->stride = buffer->shm.stride;
-
-		{
-			uint8_t *pMappedData = tex->mappedData();
-
-			if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-				for (uint32_t i = 0; i < tex->height(); i++) {
-					const uint32_t lumaPwOffset = 0;
-					memcpy(
-						&buffer->shm.data[lumaPwOffset      + i * buffer->shm.stride],
-						&pMappedData     [tex->lumaOffset() + i * tex->lumaRowPitch()],
-						std::min<size_t>(buffer->shm.stride, tex->lumaRowPitch()));
-				}
-
-				for (uint32_t i = 0; i < (tex->height() + 1) / 2; i++) {
-					const uint32_t chromaPwOffset = tex->height() * buffer->shm.stride;
-					memcpy(
-						&buffer->shm.data[chromaPwOffset      + i * buffer->shm.stride],
-						&pMappedData     [tex->chromaOffset() + i * tex->chromaRowPitch()],
-						std::min<size_t>(buffer->shm.stride, tex->chromaRowPitch()));
-				}
-			}
-			else
-			{
-				for (uint32_t i = 0; i < tex->height(); i++) {
-					memcpy(
-						&buffer->shm.data[i * buffer->shm.stride],
-						&pMappedData     [i * tex->rowPitch()],
-						std::min<size_t>(buffer->shm.stride, tex->rowPitch()));
-				}
-			}
-		}
-		break;
-	case SPA_DATA_DmaBuf:
-		dmabuf = tex->dmabuf();
-		assert(dmabuf.n_planes == 1);
-		chunk->offset = dmabuf.offset[0];
-		chunk->stride = dmabuf.stride[0];
-		chunk->size = dmabuf.height * chunk->stride;
-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-			chunk->size += ((dmabuf.height + 1)/2 * chunk->stride);
-		}
-		break;
-	default:
-		assert(false); // unreachable
 	}
 
 	int ret = pw_stream_queue_buffer(state->stream, pw_buffer);
@@ -279,26 +209,20 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	}
 	state->gamescope_info = gamescope_info;
 
-	int bpp = 4;
-	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-		bpp = 1;
-	}
-
-	state->shm_stride = SPA_ROUND_UP_N(state->video_info.size.width * bpp, 4);
-
-	const struct spa_pod_prop *modifier_prop = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
-	state->dmabuf = modifier_prop != nullptr;
+	int blocks = state->video_info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
+	// Always expose DMA-BUF capabilities (allow modifier-less exports)
+	int data_type = (1 << SPA_DATA_DmaBuf);
+	if (!SPA_FLAG_IS_SET(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER))
+		data_type |= (1 << SPA_DATA_MemFd);
 
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-
-	int data_type = state->dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
 
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 8),
-		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
 		SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
 		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
@@ -314,40 +238,9 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 		pwr_log.errorf("pw_stream_update_params failed");
 	}
 
-	pwr_log.debugf("format changed (size: %dx%d, format: %d, dmabuf: %d)",
+	pwr_log.debugf("format changed (size: %dx%d, format: %d)",
 		state->video_info.size.width, state->video_info.size.height,
-		state->video_info.format, state->dmabuf);
-}
-
-static void randname(char *buf)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	long r = ts.tv_nsec;
-	for (int i = 0; i < 6; ++i) {
-		buf[i] = 'A'+(r&15)+(r&16)*2;
-		r >>= 5;
-	}
-}
-
-static int anonymous_shm_open(void)
-{
-	char name[] = "/gamescope-pw-XXXXXX";
-	int retries = 100;
-
-	do {
-		randname(name + strlen(name) - 6);
-
-		--retries;
-		// shm_open guarantees that O_CLOEXEC is set
-		int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-		if (fd >= 0) {
-			shm_unlink(name);
-			return fd;
-		}
-	} while (retries > 0 && errno == EEXIST);
-
-	return -1;
+		state->video_info.format);
 }
 
 static constexpr EStreamColorspace spa_color_to_gamescope(const struct spa_video_info_raw& video_info)
@@ -376,107 +269,65 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 {
 	struct pipewire_state *state = (struct pipewire_state *) user_data;
 
-	struct spa_buffer *spa_buffer = pw_buffer->buffer;
-	struct spa_data *spa_data = &spa_buffer->datas[0];
-
 	struct pipewire_buffer *buffer = new pipewire_buffer();
+	pw_buffer->user_data = buffer;
 	buffer->buffer = pw_buffer;
 	buffer->gamescope_info = state->gamescope_info;
-
-	bool is_dmabuf = (spa_data->type & (1 << SPA_DATA_DmaBuf)) != 0;
-	bool is_memfd = (spa_data->type & (1 << SPA_DATA_MemFd)) != 0;
 
 	EStreamColorspace colorspace = spa_color_to_gamescope(state->video_info);
 	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
 
-	buffer->texture = new CVulkanTexture();
-	CVulkanTexture::createFlags screenshotImageFlags;
-	screenshotImageFlags.bMappable = true;
-	screenshotImageFlags.bTransferDst = true;
-	screenshotImageFlags.bStorage = true;
-	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
-	{
-		screenshotImageFlags.bExportable = true;
-		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+	CVulkanTexture::createFlags imageFlags;
+	imageFlags.bTransferDst = true;
+	imageFlags.bStorage = true;
+
+	struct spa_buffer *spa_buffer = pw_buffer->buffer;
+	for (uint32_t i = 0; i < spa_buffer->n_datas; i++) {
+		struct spa_data *d = &spa_buffer->datas[i];
+
+		if (SPA_FLAG_IS_SET(d->type, 1 << SPA_DATA_DmaBuf)) {
+			d->type = SPA_DATA_DmaBuf;
+
+			imageFlags.bExportable = true;
+			imageFlags.bLinear = true; // TODO: support modifiers
+		} else if (SPA_FLAG_IS_SET(d->type, 1 << SPA_DATA_MemFd)) {
+			d->type = SPA_DATA_MemFd;
+
+			imageFlags.bExportable = true;
+			imageFlags.bMappable = true;
+		} else {
+			pwr_log.errorf("unsupported data type");
+			d->type = SPA_DATA_Invalid;
+			return;
+		}
 	}
-	bool bImageInitSuccess = buffer->texture->BInit( state->video_info.size.width, state->video_info.size.height, 1u, drmFormat, screenshotImageFlags );
-	if ( !bImageInitSuccess )
-	{
+
+	pwr_log.debugf("creating texture (exportable: %d, mappable: %d)", imageFlags.bExportable, imageFlags.bMappable);
+	buffer->texture = new CVulkanTexture();
+	if (!buffer->texture->BInit(state->video_info.size.width, state->video_info.size.height, 1u, drmFormat, imageFlags)) {
 		pwr_log.errorf("Failed to initialize pipewire texture");
-		goto error;
+		return;
 	}
 	buffer->texture->setStreamColorspace(colorspace);
 
-	if (is_dmabuf) {
-		const struct wlr_dmabuf_attributes dmabuf = buffer->texture->dmabuf();
-		if (dmabuf.n_planes != 1)
-		{
-			pwr_log.errorf("dmabuf.n_planes != 1");
-			goto error;
-		}
+	uint8_t *mappedData = buffer->texture->mappedData();
+	const auto& dmabuf = buffer->texture->dmabuf();
+	for (uint32_t i = 0; i < spa_buffer->n_datas; i++) {
+		struct spa_data *d = &spa_buffer->datas[i];
+		d->flags = SPA_DATA_FLAG_READABLE;
+		if (imageFlags.bExportable && imageFlags.bMappable)
+			d->flags |= SPA_DATA_FLAG_MAPPABLE;
 
-		off_t size = lseek(dmabuf.fd[0], 0, SEEK_END);
-		if (size < 0) {
-			pwr_log.errorf_errno("lseek failed");
-			goto error;
-		}
+		const auto& layout = buffer->texture->planeLayout(i);
+		d->fd = dmabuf.fd[i];
+		d->maxsize = layout.size;
+		d->mapoffset = 0;
+		d->data = mappedData;
 
-		buffer->type = SPA_DATA_DmaBuf;
-
-		spa_data->type = SPA_DATA_DmaBuf;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = dmabuf.fd[0];
-		spa_data->mapoffset = dmabuf.offset[0];
-		spa_data->maxsize = size;
-		spa_data->data = nullptr;
-	} else if (is_memfd) {
-		int fd = anonymous_shm_open();
-		if (fd < 0) {
-			pwr_log.errorf("failed to create shm file");
-			goto error;
-		}
-
-		size_t size = state->shm_stride * state->video_info.size.height;
-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-			size += state->shm_stride * ((state->video_info.size.height + 1) / 2);
-		}
-		if (ftruncate(fd, size) != 0) {
-			pwr_log.errorf_errno("ftruncate failed");
-			close(fd);
-			goto error;
-		}
-
-		void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-		if (data == MAP_FAILED) {
-			pwr_log.errorf_errno("mmap failed");
-			close(fd);
-			goto error;
-		}
-
-		buffer->type = SPA_DATA_MemFd;
-		buffer->shm.size = size;
-		buffer->shm.stride = state->shm_stride;
-		buffer->shm.data = (uint8_t *) data;
-		buffer->shm.fd = fd;
-
-		spa_data->type = SPA_DATA_MemFd;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = fd;
-		spa_data->mapoffset = 0;
-		spa_data->maxsize = size;
-		spa_data->data = data;
-	} else {
-		pwr_log.errorf("unsupported data type");
-		spa_data->type = SPA_DATA_Invalid;
-		goto error;
+		d->chunk->offset = layout.offset;
+		d->chunk->size = layout.size;
+		d->chunk->stride = layout.rowPitch;
 	}
-
-	pw_buffer->user_data = buffer;
-
-	return;
-
-error:
-	delete buffer;
 }
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
