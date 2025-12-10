@@ -81,9 +81,13 @@ static const struct spa_pod *build_format_params(struct spa_pod_builder *builder
 }
 
 
-static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder)
+static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder, const struct spa_video_info_raw *fixated = nullptr)
 {
 	std::vector<const struct spa_pod *> params;
+
+	if (fixated != nullptr) {
+		params.push_back(spa_format_video_raw_build(builder, SPA_PARAM_EnumFormat, fixated));
+	}
 
 	for (const enum spa_video_format format : {
 		SPA_VIDEO_FORMAT_BGRx,
@@ -209,29 +213,35 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	}
 	state->gamescope_info = gamescope_info;
 
+	state->video_info.modifier = DRM_FORMAT_MOD_LINEAR; // TODO
 	int blocks = state->video_info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
 	// Always expose DMA-BUF capabilities (allow modifier-less exports)
 	int data_type = (1 << SPA_DATA_DmaBuf);
 	if (!SPA_FLAG_IS_SET(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER))
 		data_type |= (1 << SPA_DATA_MemFd);
 
-	uint8_t buf[1024];
+	uint8_t buf[4096];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+	std::vector<const struct spa_pod *> params;
 
-	const struct spa_pod *buffers_param =
-		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 8),
-		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
-		SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
-		SPA_PARAM_BUFFERS_stride, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
-		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
-	const struct spa_pod *meta_param =
-		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
-		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
-	std::array params = { buffers_param, meta_param };
+	if (SPA_FLAG_IS_SET(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED)) {
+		SPA_FLAG_CLEAR(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED);
+		params = build_format_params(&builder, &state->video_info);
+	} else {
+		params = {
+			(const struct spa_pod *) spa_pod_builder_add_object(&builder,
+				SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+				SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 1, 8),
+				SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
+				SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
+				SPA_PARAM_BUFFERS_stride, SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
+				SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type)),
+			(const struct spa_pod *) spa_pod_builder_add_object(&builder,
+				SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+				SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)))
+		};
+	}
 
 	ret = pw_stream_update_params(state->stream, params.data(), params.size());
 	if (ret != 0) {
@@ -280,6 +290,9 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	CVulkanTexture::createFlags imageFlags;
 	imageFlags.bTransferDst = true;
 	imageFlags.bStorage = true;
+	if (SPA_FLAG_IS_SET(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER)) {
+		imageFlags.exportModifiers = {&state->video_info.modifier, 1};
+	}
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 	for (uint32_t i = 0; i < spa_buffer->n_datas; i++) {
@@ -289,7 +302,15 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 			d->type = SPA_DATA_DmaBuf;
 
 			imageFlags.bExportable = true;
-			imageFlags.bLinear = true; // TODO: support modifiers
+			if (imageFlags.exportModifiers.size() == 0) {
+				// TODO: This should probably be `bMappable`. From the pipewire dma-buf documentation:
+				// "[The producer can] choose DMA-BUF as the used buffer type even though no modifier is present, if it
+				// can guarantee that the used buffer is mmapable."
+				// If we use `bMappable`, it might no longer be device local, which could potentially hurt performance
+				// for the more common use case of importing the fd instead of mmap-ing it. Use SPA_DATA_MemFd instead.
+				// We do force a linear layout, because we won't be able to communicate any tiling or compression.
+				imageFlags.bLinear = true;
+			}
 		} else if (SPA_FLAG_IS_SET(d->type, 1 << SPA_DATA_MemFd)) {
 			d->type = SPA_DATA_MemFd;
 

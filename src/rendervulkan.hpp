@@ -142,6 +142,7 @@ public:
 			bOutputImage = false;
 			bColorAttachment = false;
 			imageType = VK_IMAGE_TYPE_2D;
+			exportModifiers = {};
 		}
 
 		bool bFlippable : 1;
@@ -155,6 +156,7 @@ public:
 		bool bOutputImage : 1;
 		bool bColorAttachment : 1;
 		VkImageType imageType;
+		std::span<const uint64_t> exportModifiers;
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );

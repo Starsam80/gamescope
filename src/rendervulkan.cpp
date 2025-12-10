@@ -2146,30 +2146,23 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	std::vector<uint64_t> modifiers = {};
 	// TODO(JoshA): Move this code to backend for making flippable image.
-	if ( GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA )
+	if ( GetBackend()->UsesModifiers() && flags.bFlippable )
 	{
 		assert( drmFormat != DRM_FORMAT_INVALID );
+		static const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
 
-		uint64_t linear = DRM_FORMAT_MOD_LINEAR;
-
-		const uint64_t *possibleModifiers;
-		size_t numPossibleModifiers;
 		if ( flags.bLinear )
-		{
-			possibleModifiers = &linear;
-			numPossibleModifiers = 1;
-		}
+			flags.exportModifiers = {&linear, 1};
 		else
-		{
-			std::span<const uint64_t> modifiers = GetBackend()->GetSupportedModifiers( drmFormat );
-			assert( !modifiers.empty() );
-			possibleModifiers = modifiers.data();
-			numPossibleModifiers = modifiers.size();
-		}
+			flags.exportModifiers = GetBackend()->GetSupportedModifiers( drmFormat );
+	}
 
-		for ( size_t i = 0; i < numPossibleModifiers; i++ )
+	if ( flags.bExportable == true && g_device.supportsModifiers() )
+	{
+		for ( const uint64_t modifier : flags.exportModifiers )
 		{
-			uint64_t modifier = possibleModifiers[i];
+			if (gamescope::Algorithm::Contains(modifiers, modifier))
+				continue;
 
 			VkExternalImageFormatProperties externalFormatProps = {
 				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -2187,9 +2180,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 			modifiers.push_back( modifier );
 		}
+	}
 
-		assert( modifiers.size() > 0 );
-
+	if ( modifiers.size() > 0 )
+	{
 		modifierListInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
 			.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
@@ -2198,6 +2192,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		};
 
 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	}
+	else if ( flags.bExportable == true && gamescope::Algorithm::Contains(flags.exportModifiers, DRM_FORMAT_MOD_LINEAR) )
+	{
+		// Attempt fallback to "Vulkan linear" instead of using DRM modifiers
+		imageInfo.tiling = tiling = VK_IMAGE_TILING_LINEAR;
 	}
 
 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
