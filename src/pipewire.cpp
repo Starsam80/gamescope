@@ -93,9 +93,10 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 		SPA_VIDEO_FORMAT_BGRx,
 		SPA_VIDEO_FORMAT_NV12,
 	}) {
-		// TODO: Get supported modifiers for format
-		std::vector<uint64_t> modifiers = { DRM_FORMAT_MOD_LINEAR };
-		params.push_back(build_format_params(builder, format, modifiers));
+		const uint32_t drmFormat = spa_format_to_drm(format);
+		std::span<const uint64_t> modifiers = GetSupportedSampleModifiers(drmFormat);
+		if (modifiers.size() != 0) 
+			params.push_back(build_format_params(builder, format, modifiers));
 		params.push_back(build_format_params(builder, format, {}));
 	}
 
@@ -213,8 +214,36 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	}
 	state->gamescope_info = gamescope_info;
 
-	state->video_info.modifier = DRM_FORMAT_MOD_LINEAR; // TODO
-	int blocks = state->video_info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
+	CVulkanTexture::createFlags probeFlags;
+	probeFlags.bTransferDst = true;
+	probeFlags.bStorage = true;
+
+	const struct spa_pod_prop *modifier_prop = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier);
+	if (modifier_prop) {
+		uint32_t n_values, choice;
+		struct spa_pod *values = spa_pod_get_values(&modifier_prop->value, &n_values, &choice);
+		assert(choice == SPA_CHOICE_None || choice == SPA_CHOICE_Enum);
+
+		probeFlags.exportModifiers = {(const uint64_t *) SPA_POD_BODY(values), n_values};
+	}
+
+	probeFlags.bExportable = true;
+	if (probeFlags.exportModifiers.size() == 0) {
+		probeFlags.bMappable = true;
+		SPA_FLAG_CLEAR(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER);
+	}
+
+	const uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
+	CVulkanTexture tex;
+	if (!tex.BInit(state->video_info.size.width, state->video_info.size.height, 1u, drmFormat, probeFlags)) {
+		pwr_log.errorf("texture probe failed");
+		return;
+	}
+
+	const auto& dmabuf = tex.dmabuf();
+	state->video_info.modifier = dmabuf.modifier;
+	int blocks = dmabuf.n_planes;
+
 	// Always expose DMA-BUF capabilities (allow modifier-less exports)
 	int data_type = (1 << SPA_DATA_DmaBuf);
 	if (!SPA_FLAG_IS_SET(state->video_info.flags, SPA_VIDEO_FLAG_MODIFIER))

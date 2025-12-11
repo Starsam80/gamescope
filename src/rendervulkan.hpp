@@ -85,6 +85,8 @@ struct VulkanWlrTexture_t
 	struct wlr_buffer *buf;
 };
 
+std::span<const uint64_t> GetSupportedSampleModifiers( uint32_t uDrmFormat );
+
 inline VkFormat ToSrgbVulkanFormat( VkFormat format )
 {
 	switch ( format )
