@@ -2007,6 +2007,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 {
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
+	m_format = DRMFormatToVulkan(drmFormat, false);
+	assert( m_format != VK_FORMAT_UNDEFINED );
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
 	VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2073,7 +2075,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkImageCreateInfo imageInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = flags.imageType,
-		.format = DRMFormatToVulkan(drmFormat, false),
+		.format = m_format,
 		.extent = {
 			.width = width,
 			.height = height,
@@ -2086,8 +2088,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.usage = usage,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	};
-
-	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
 	std::array<VkFormat, 2> formats = {
 		DRMFormatToVulkan(drmFormat, false),
@@ -2103,6 +2103,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	if ( formats[0] != formats[1] )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
+		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	}
+
+	if ( isYcbcr() && flags.bStorage ) {
 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	}
 
@@ -2234,8 +2238,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		m_contentWidth = width;
 		m_contentHeight = height;
 	}
-
-	m_format = imageInfo.format;
 
 	res = g_device.vk.CreateImage(g_device.device(), &imageInfo, nullptr, &m_vkImage);
 	if (res != VK_SUCCESS) {
